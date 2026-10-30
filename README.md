@@ -22,6 +22,7 @@ You need: `gh` logged in with access to your repo, push rights. You do NOT need 
 - **Allowed owners** are edited in `/srv/registry/config.json`. Gate decisions are logged to `/srv/registry/gate.log`; package installs to `/var/log/lunova-provision.log`.
 - **Provisioning**: `lunova-site release` installs missing PHP extensions (from composer's platform check), the DB driver/engine and manifest `packages:` through `sudo lunova-provision` (root helper; refuses system/security/container/web-server packages). Databases are created by `sudo lunova-db ensure <site>` (MariaDB or PostgreSQL); passwords are generated and kept root-side.
 - **Sealed env**: `scripts/lunova-seal` encrypts values with the server's public key (`skills/lunova-deploy/seal.pub.pem`; the private key is `/var/lib/lunova/seal/private.pem`, owner deploy, mode 600). The sealed file is committed in the project.
+- **Release retention**: after each healthy deploy `lunova-site release` keeps only the last 3 healthy releases (`KEEP = 3`, always including `current`) and deletes the rest, including failed ones.
 - Server tools: `server/lunova-site`, `lunova-gate`, `lunova-authkeys` -> `/usr/local/bin`; `lunova-provision`, `lunova-db` -> `/usr/local/sbin`. Reinstall after editing with `scp` + `sudo install -m 755 -o root -g root`. Tag `v2` after workflow changes are merged.
 
 ## Known limits
