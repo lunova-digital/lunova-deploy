@@ -75,7 +75,7 @@ jobs:
           ssh-keygen -lf ~/.ssh/known_hosts | grep -qF "$LUNOVA_HOST_FPR" \
             || { echo "::error::Server host key does not match the pinned fingerprint. Refusing to connect."; exit 1; }
           printf 'Host lunova\n  HostName %s\n  User deploy\n  IdentityFile ~/.ssh/lunova_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile ~/.ssh/known_hosts\n' "$LUNOVA_HOST" > ~/.ssh/config
-          ssh -o BatchMode=yes lunova true
+          ssh -o BatchMode=yes lunova lunova-site list >/dev/null
 
       - name: Preflight (capabilities and domains)
         if: env.MODE == 'check'
