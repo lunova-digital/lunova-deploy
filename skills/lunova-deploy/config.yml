@@ -1,8 +1,8 @@
 # Lunova deploy configuration. Maintained by ops; developers do not edit this.
 server_ip: 152.42.168.192
 host_fingerprint: SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s
-# One-time ops setup creates this repo (see README.md of the lunova-deploy repo).
-workflow_repo: REPLACE_ORG/lunova-deploy
+# Shared workflow repo (private, org: lunova-digital). Developer repos that deploy must live in this org to see the org secret/variables.
+workflow_repo: lunova-digital/lunova-deploy
 workflow_ref: v1
 # Org-level secret/variable names that ops sets. Developers never see their values.
 org_secret: LUNOVA_DEPLOY_KEY

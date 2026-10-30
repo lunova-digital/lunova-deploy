@@ -35,7 +35,9 @@ developer push  ->  GitHub Actions (their repo)  ->  shared workflow <workflow_r
 Inspect the repo and report facts, not guesses:
 - **Stack**: `composer.json` (Laravel? PHP version, extensions), `package.json` (framework, build script, node engine), `requirements.txt`/`pyproject.toml`, `Dockerfile`, static `index.html`.
 - **Current deploy approach**: `.github/workflows/*`, `deploy*` scripts, `Procfile`, `vercel.json`/`netlify.toml`/`fly.toml`, FTP/rsync/SSH actions, CI config of other providers. Say *how* it deploys today (trigger branch, mechanism, target host), whether `vendor/`, `node_modules` or built assets are built in CI or committed, and whether it runs migrations.
-- **Runtime needs**: database (from `.env.example` / config), queue worker, scheduler/cron, file uploads/storage, websockets, long-running processes, background jobs, mail, required env var **names**.
+- **Runtime needs**: database (from `.env.example` / config), queue worker (`ShouldQueue`, `QUEUE_CONNECTION`), scheduler (`routes/console.php`), file uploads/storage, websockets, long-running processes, mail, required env var **names**. Lunova provides DB, queue worker and scheduler automatically via `.lunova.yml` (`database: mysql`, `queue: true`, `scheduler: true`).
+- **PHP platform**: for Laravel/PHP, check `composer.lock` is installable on the server's PHP (8.3): `config.platform.php` must be set; otherwise plan to add it and re-resolve (see `references/stacks.md`).
+- **Org**: the repo must live in the `lunova-digital` GitHub org to see the org secret/variables. If it lives elsewhere, ask the developer to transfer it (or ops to set repo-level secrets).
 - **Risks found**: secrets or passwords committed (in workflows, `.env`), plaintext FTP, no rollback, no health check, debug mode, missing build step. Quote the file and line, never the secret value.
 - **Git**: remote, current branch, default branch, whether `gh` is authenticated (`gh auth status`) and can see the repo.
 
@@ -46,7 +48,7 @@ Give the developer a short, plain summary:
 - **Blockers needing ops** (from step 4), if any.
 
 ### 3. Interview (AskUserQuestion, one batch, with defaults)
-Ask only what you cannot infer: site name (suggest from repo name), production domain(s) (and whether DNS A record points to the server IP in `config.yml` or they need ops/IT to set it), deploy branch, app environment (offer to build `LUNOVA_ENV` from their local `.env.production`/`.env` for them to review), database choice, anything ambiguous found in discovery (queues, uploads, scheduler).
+Ask only what you cannot infer: site name (suggest from repo name), production domain(s) (and whether DNS A record points to the server IP in `config.yml` or they need ops/IT to set it), deploy branch, app environment (offer to build `LUNOVA_ENV` from their local `.env.production`/`.env` for them to review; DB_* are not needed, the server injects them), whether there is **existing production data to move** from another host (if yes it is an ops-run cutover: `references/ops-requests.md` #4), anything ambiguous found in discovery (queues, uploads, scheduler).
 
 ### 4. Preflight
 - Check the org workflow repo from `config.yml` exists and is reachable: `gh repo view <workflow_repo>`. If `workflow_repo` still says `REPLACE_ORG`, or org secrets/variables are not visible to the repo, that is an ops request (one-time Lunova setup).
@@ -55,7 +57,7 @@ Ask only what you cannot infer: site name (suggest from repo name), production d
 ### 5. Generate (show the files before writing)
 - `.lunova.yml` from `templates/lunova.yml`, filled from discovery and answers, following `references/manifest.md` and the stack recipe.
 - `.github/workflows/lunova-deploy.yml` from `templates/lunova-deploy.yml`, replacing `__BRANCH__`, `__WORKFLOW_REPO__`, `__WORKFLOW_REF__` from `config.yml`.
-- Do **not** touch the old deploy workflow yet. Work on a new branch `lunova-deploy`.
+- Do **not** touch the old deploy workflow yet unless the developer already asked to remove it. Work on a new branch `lunova-deploy`.
 - Offer to set `LUNOVA_ENV` (`gh secret set LUNOVA_ENV < file`): build the file from the real `.env` with production-appropriate values (APP_ENV=production, APP_DEBUG=false, correct APP_URL, a generated APP_KEY only if absent). Show only variable names and which ones need the developer's input. Delete any temp file after.
 
 ### 6. Push and verify
@@ -68,7 +70,7 @@ Ask only what you cannot infer: site name (suggest from repo name), production d
 ### 7. Day-2 help
 - Deploy: push to the deploy branch. Check: `gh workflow run lunova-deploy.yml -f mode=check`.
 - Roll back: `gh workflow run lunova-deploy.yml -f mode=rollback` (previous release) or `-f rollback_to=<release id>`.
-- Logs/status: the workflow run log (the release step prints the health result). Server logs need ops.
+- Status / logs (no server access needed): `gh workflow run lunova-deploy.yml -f mode=status` and `-f mode=logs` (optional `-f lines=200`), then `gh run watch` and read the job log. Server-level logs (Caddy, system) need ops.
 
 ## Output style
 Plain language for the developer. Short summaries, concrete next step at the end of each phase. When you need something from ops, give them one copy-pasteable message, not a lecture.

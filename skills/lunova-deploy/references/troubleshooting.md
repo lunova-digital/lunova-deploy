@@ -15,3 +15,10 @@
 | `shared/.env is missing` | no `LUNOVA_ENV` secret yet | set the secret, redeploy |
 | Certificate/HTTPS error on first visit | DNS not pointing at server yet or still propagating | `mode=check`, fix DNS, wait, retry |
 | `Could not resolve to a Repository` (gh) | wrong gh account / no access | `gh auth status`, `gh auth switch` |
+| `requires php >=8.4` during composer install | lock resolved on a newer PHP than the server's 8.3 | add `config.platform.php = 8.3.0` to composer.json and `composer update` (see stacks.md) |
+| `Access denied for user` / SQLSTATE[HY000] [1045] | DB_* overridden in LUNOVA_ENV or `database: mysql` missing in `.lunova.yml` | set `database: mysql`; remove DB_* from `LUNOVA_ENV` (server injects them) |
+| queued jobs/mail never sent | `queue: true` missing | add `queue: true`, redeploy |
+| scheduled task never runs | `scheduler: true` missing | add `scheduler: true`, redeploy |
+| 500 right after deploy, `rolled back` | see `logs` mode | `gh workflow run lunova-deploy.yml -f mode=logs` |
+| `OK (Cloudflare proxy)` for a domain in check | domain is behind Cloudflare | origin not verifiable: keep DNS-only for the first cert (ops request #3) |
+| `rollback`: no earlier successful release | only one healthy release exists | deploy again or use `-f rollback_to=<id>` |

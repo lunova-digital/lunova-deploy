@@ -6,16 +6,20 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: "deploy | check | rollback"
+        description: "deploy | check | rollback | status | logs"
         type: string
         default: deploy
       manifest:
         type: string
         default: .lunova.yml
       rollback_to:
-        description: "Release id to roll back to (empty = previous release)"
+        description: "Release id to roll back to (empty = previous healthy release)"
         type: string
         default: ""
+      lines:
+        description: "Log lines to show in logs mode"
+        type: string
+        default: "80"
     secrets:
       LUNOVA_DEPLOY_KEY:
         required: true
@@ -36,6 +40,7 @@ jobs:
       MODE: ${{ inputs.mode }}
       MANIFEST: ${{ inputs.manifest }}
       ROLLBACK_TO: ${{ inputs.rollback_to }}
+      LOG_LINES: ${{ inputs.lines }}
       LUNOVA_HOST: ${{ vars.LUNOVA_HOST }}
       LUNOVA_HOST_FPR: ${{ vars.LUNOVA_HOST_FPR }}
     steps:
@@ -82,6 +87,19 @@ jobs:
           rc=$?
           [ $rc -eq 0 ] && echo "::notice::Preflight passed" || echo "::warning::Domain problems above (DNS may still be propagating)"
 
+      - name: Status
+        if: env.MODE == 'status'
+        run: |
+          set -euo pipefail
+          ssh lunova "lunova-site status $SITE"
+
+      - name: Logs
+        if: env.MODE == 'logs'
+        run: |
+          set -euo pipefail
+          [[ "$LOG_LINES" =~ ^[0-9]+$ ]] || LOG_LINES=80
+          ssh lunova "lunova-site logs $SITE --lines $LOG_LINES"
+
       - name: Roll back
         if: env.MODE == 'rollback'
         run: |
@@ -125,6 +143,9 @@ jobs:
           [ -n "$ROOT" ] && args+=(--root "$ROOT")
           [ -n "$START" ] && args+=(--start "$START")
           [ "$HTTP_ONLY" = "true" ] && args+=(--http-only)
+          [ "$(yq -r '.database // ""' "$MANIFEST")" = "mysql" ] && args+=(--database mysql)
+          [ "$(yq -r '.queue // false' "$MANIFEST")" = "true" ] && args+=(--queue)
+          [ "$(yq -r '.scheduler // false' "$MANIFEST")" = "true" ] && args+=(--scheduler)
           if [ "$(yq -r 'has("hooks")' "$MANIFEST")" = "true" ]; then
             if [ "$(yq -r '.hooks | length' "$MANIFEST")" = "0" ]; then
               args+=(--hook true)   # hooks: [] means "run none"

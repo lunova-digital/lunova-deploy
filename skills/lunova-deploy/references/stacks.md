@@ -1,15 +1,17 @@
 # Stack recipes
 
-Server today: Ubuntu 24.04, 2 GB RAM, **only Python 3.12, git, rsync preinstalled**. Node, PHP, Composer, databases are **not installed**: the first project needing them triggers an ops request. Use `mode=check` to read the live capabilities before assuming.
+Server today: Ubuntu 24.04, 2 GB RAM + 4 GB swap. Installed: Python 3.12, **PHP 8.3 + FPM, Composer, Node 22, MariaDB 10.11**, Caddy. Not installed: Docker, Redis, PostgreSQL, other PHP versions: those are ops requests. Use `mode=check` to read the live capabilities before assuming (it also shows free disk and registered sites). Memory is limited: avoid heavy build steps on the server, build in CI.
 
 ## laravel
-Needs ops (one time per server, shared by all Laravel sites): PHP-FPM (8.3 or 8.4) with Laravel extensions, a pool `lunova` running as user `deploy` with socket `/run/php/lunova.sock` (`listen.owner=caddy`, `listen.group=caddy`, mode 0660), PHP CLI + Composer for `deploy`, plus a database (MySQL/MariaDB or PostgreSQL) with a DB and user **per site** (ops creates these; the developer puts the credentials in `LUNOVA_ENV`).
-Manifest: `type: laravel`, `php: "8.3"` (match `composer.json`), `build` defaults to composer install; if assets are built (Vite) add `node` and `npm ci && npm run build` **unless** `public/build` is committed. Default server hooks run migrations and caches. Document root is `public`.
-Also decide: queue worker (needs a user service: ask ops or use `QUEUE_CONNECTION=sync`), scheduler (needs a cron/timer: ops request), file uploads (use `shared/storage`, persists across releases), mail (SMTP credentials in `LUNOVA_ENV`).
-`.env` must have `APP_ENV=production`, `APP_DEBUG=false`, real `APP_URL`, `APP_KEY`.
+Server provides (installed once): PHP 8.3 + FPM pool `lunova` (runs as `deploy`), Composer 2.7, MariaDB 10.11, Node 22. Per site everything else is automatic.
+Manifest: `type: laravel`, `php: "8.3"`, `database: mysql` (server creates DB + user), `queue: true` if the app dispatches queued jobs/mail (`QUEUE_CONNECTION=database`), `scheduler: true` if `routes/console.php` schedules commands. Defaults: `build` = composer install, `hooks` = migrate, config/route/view/event cache, storage:link. Document root is `public`.
+**PHP platform rule (important):** the server runs PHP 8.3. `composer.lock` must be installable on 8.3, otherwise CI/server `composer install` fails with "requires php >=8.4". Check `composer.json` for `"config": {"platform": {"php": "8.3.0"}}`; if missing add it and run `composer update` so the lock is resolved for 8.3 (do not resolve on a newer local PHP). Verify with the `check` run.
+`public/build` committed = no Node build needed; otherwise set `node: "22"` and `build: [composer install ..., npm ci, npm run build]`.
+Uploads: `shared/storage` persists across releases; `storage:link` runs automatically. Mail: SMTP credentials in `LUNOVA_ENV`. `.env` must have `APP_ENV=production`, `APP_DEBUG=false`, real `APP_URL`, `APP_KEY` (reuse the existing production key if the old host has live sessions/encrypted data).
+Sessions/cache in the database need the app's migrations (run automatically by the hook).
 
 ## node
-Needs ops: Node (version in `package.json` engines) available to `deploy`. Manifest: `type: node`, `start: node server.js` (or `npm start`), app must listen on `process.env.PORT` and `127.0.0.1`. Default hook: `npm ci --omit=dev` on the server. Next.js/Nuxt SSR: build in CI (`npm run build`), set `include_node_modules: true` or keep the default and let the server install, start with `npm start`/`node .output/server/index.mjs`.
+Node 22 is installed. Needs ops only if `package.json` engines require a different major. Manifest: `type: node`, `start: node server.js` (or `npm start`), app must listen on `process.env.PORT` and `127.0.0.1`. Default hook: `npm ci --omit=dev` on the server. Next.js/Nuxt SSR: build in CI (`npm run build`), set `include_node_modules: true` or keep the default and let the server install, start with `npm start`/`node .output/server/index.mjs`.
 
 ## spa / static
 No server runtime needed. `type: spa` rewrites unknown paths to `/index.html`. Set `root` to the build output (`dist`, `build`, `public`) and make sure the CI `build` produces it. Cheapest, safest option. Next.js static export, Vite, CRA, Astro static, plain HTML.
