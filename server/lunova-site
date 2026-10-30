@@ -17,6 +17,7 @@ ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 TYPES = ("static", "spa", "node", "python", "laravel")
 RESERVED = {"default", "caddy", "registry", "lunova", "admin", "root", "deploy", "ops"}
 KEEP = 5
+DB_KEYS = ("DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_DATABASE", "DB_USERNAME", "DB_PASSWORD")
 PORTS = range(3100, 4000)
 DEFAULT_HOOKS = {
     "laravel": ["php artisan migrate --force", "php artisan config:cache", "php artisan route:cache",
@@ -107,6 +108,61 @@ def render_unit(site, d):
             f"Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n")
 
 
+def render_queue_unit(site):
+    return (f"[Unit]\nDescription=Lunova queue worker {site}\nAfter=network.target\n\n[Service]\n"
+            f"WorkingDirectory=/srv/sites/{site}/current\n"
+            "ExecStart=/usr/bin/php artisan queue:work --sleep=3 --tries=3 --max-time=3600\n"
+            "Restart=always\nRestartSec=3\nMemoryMax=300M\n\n[Install]\nWantedBy=default.target\n")
+
+
+def render_schedule_units(site):
+    svc = (f"[Unit]\nDescription=Lunova scheduler tick {site}\n\n[Service]\nType=oneshot\n"
+           f"WorkingDirectory=/srv/sites/{site}/current\nExecStart=/usr/bin/php artisan schedule:run\n")
+    tmr = (f"[Unit]\nDescription=Lunova scheduler {site} (every minute)\n\n[Timer]\nOnCalendar=*-*-* *:*:00\n"
+           "AccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n")
+    return svc, tmr
+
+
+def sync_workers(site, d):
+    """Create/remove the queue worker and scheduler timer according to the registry (laravel only)."""
+    UNITS.mkdir(parents=True, exist_ok=True)
+    q, sch = UNITS / f"site-{site}-queue.service", UNITS / f"site-{site}-schedule.service"
+    tm = UNITS / f"site-{site}-schedule.timer"
+    if d.get("queue") and d["type"] == "laravel":
+        q.write_text(render_queue_unit(site)); run(["systemctl", "--user", "enable", q.name], check=False)
+    elif q.exists():
+        run(["systemctl", "--user", "disable", "--now", q.name], check=False); q.unlink()
+    if d.get("scheduler") and d["type"] == "laravel":
+        svc, tmr = render_schedule_units(site); sch.write_text(svc); tm.write_text(tmr)
+        run(["systemctl", "--user", "enable", tm.name], check=False)
+    elif tm.exists():
+        run(["systemctl", "--user", "disable", "--now", tm.name], check=False); tm.unlink(missing_ok=True); sch.unlink(missing_ok=True)
+    run(["systemctl", "--user", "daemon-reload"])
+
+
+def ensure_db(site):
+    """Ask the root helper for DB credentials; keep them in shared/db.env (0600)."""
+    p = run(["sudo", "-n", "/usr/local/sbin/lunova-db", "ensure", site])
+    shared = SITES / site / "shared"; shared.mkdir(parents=True, exist_ok=True)
+    tmp = shared / "db.env.tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(p.stdout)
+    tmp.replace(shared / "db.env")
+
+
+def build_env(site):
+    """shared/.env = shared/.env.base (from the LUNOVA_ENV secret) with DB_* overridden by shared/db.env."""
+    shared = SITES / site / "shared"; base, dbf = shared / ".env.base", shared / "db.env"
+    if not base.exists():
+        if (shared / ".env").exists() and not (shared / ".env").is_symlink(): shutil.copy(shared / ".env", base)
+        elif not dbf.exists(): return False
+    lines = base.read_text().splitlines() if base.exists() else []
+    if dbf.exists():
+        lines = [l for l in lines if l.split("=", 1)[0].strip() not in DB_KEYS] + [""] + dbf.read_text().splitlines()
+    tmp = shared / ".env.tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write("\n".join(lines).strip("\n") + "\n")
+    tmp.replace(shared / ".env"); return True
+
+
 def cmd_capabilities(a):
     def ver(c, flag="--version"):
         p = run([c, flag], check=False) if shutil.which(c) else None
@@ -155,7 +211,9 @@ def cmd_register(a):
         die(f"PHP-FPM socket {php_socket()} not found: ops must set up PHP-FPM first (see ops request: laravel)")
     d = {"site": a.site, "type": a.type, "domains": domains, "repo": a.repo or (old or {}).get("repo"),
          "root": a.root or "", "http_only": bool(a.http_only), "health_path": a.health_path,
-         "hooks": a.hook if a.hook is not None else DEFAULT_HOOKS.get(a.type, [])}
+         "hooks": a.hook if a.hook is not None else DEFAULT_HOOKS.get(a.type, []),
+         "database": a.database, "queue": bool(a.queue), "scheduler": bool(a.scheduler)}
+    if (a.queue or a.scheduler) and a.type != "laravel": die("--queue/--scheduler are only supported for laravel sites")
     if a.type in ("node", "python"):
         if not a.start and not (old and old.get("start")): die("--start is required for node/python sites")
         start = a.start or old["start"]
@@ -174,16 +232,26 @@ def cmd_register(a):
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", f"site-{a.site}.service"], check=False)
     save(a.site, d)
+    if d["database"]: ensure_db(a.site); build_env(a.site)
+    sync_workers(a.site, d)
     try: caddy_reload()
     except SystemExit:
         (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); raise
-    say(f"registered {a.site} ({a.type}) -> {', '.join(domains)}" + (f" on port {d['port']}" if d.get("port") else ""))
+    say(f"registered {a.site} ({a.type}) -> {', '.join(domains)}" + (f" on port {d['port']}" if d.get("port") else "")
+        + (" +db" if d["database"] else "") + (" +queue" if d["queue"] else "") + (" +scheduler" if d["scheduler"] else ""))
     result(ok=True, site=a.site, type=a.type, domains=domains, port=d.get("port"), updated=bool(old))
 
 
 def releases(site):
     d = SITES / site / "releases"
     return sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime) if d.exists() else []
+
+
+def ok_ts(rel):
+    """Epoch when a release passed its health check (marker written only on success), else None."""
+    m = Path(rel) / ".lunova-ok"
+    try: return int(m.read_text().strip())
+    except (OSError, ValueError): return None
 
 
 def current_target(site):
@@ -199,6 +267,9 @@ def switch(site, rel):
 def restart(site, d):
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "restart", f"site-{site}.service"])
+    if d["type"] == "laravel":
+        if d.get("queue"): run(["systemctl", "--user", "restart", f"site-{site}-queue.service"])
+        if d.get("scheduler"): run(["systemctl", "--user", "start", f"site-{site}-schedule.timer"])
 
 
 def health(site, d):
@@ -227,6 +298,7 @@ def cmd_release(a):
     rel = SITES / a.site / "releases" / a.id
     if not rel.is_dir(): die(f"release {rel} not found: upload it first")
     env = SITES / a.site / "shared" / ".env"
+    build_env(a.site)
     if d["type"] == "laravel":
         if not env.exists(): die("shared/.env is missing: set the LUNOVA_ENV secret in the repo and redeploy")
         shared_storage = SITES / a.site / "shared" / "storage"
@@ -250,18 +322,26 @@ def cmd_release(a):
         say(f"health check failed ({code}) at {url}")
         if prev: switch(a.site, prev); restart(a.site, d); say(f"rolled back to {os.path.basename(prev)}")
         result(ok=False, site=a.site, release=a.id, health=str(code), rolled_back=bool(prev)); sys.exit(3)
-    os.utime(rel)
-    for old in releases(a.site)[:-KEEP]:
-        if str(old) != current_target(a.site): shutil.rmtree(old, ignore_errors=True)
+    (rel / ".lunova-ok").write_text(str(int(time.time())))
+    good = sorted((r for r in releases(a.site) if ok_ts(r)), key=ok_ts)
+    keep = {str(r) for r in good[-KEEP:]} | {current_target(a.site)}
+    for old in releases(a.site):  # also removes failed (unmarked) releases
+        if str(old) not in keep: shutil.rmtree(old, ignore_errors=True)
     say(f"released {a.site} {a.id} (health {code})")
     result(ok=True, site=a.site, release=a.id, health=code, domains=d["domains"])
 
 
 def cmd_rollback(a):
     check_name(a.site); d = load(a.site)
-    cur = current_target(a.site); rels = [r for r in releases(a.site) if str(r) != cur]
-    target = (SITES / a.site / "releases" / a.to) if a.to else (rels[-1] if rels else None)
-    if not target or not target.is_dir(): die("no previous release to roll back to")
+    cur = current_target(a.site)
+    if a.to:
+        target = SITES / a.site / "releases" / a.to
+        if not ID_RE.match(a.to) or not target.is_dir(): die(f"release {a.to} not found")
+    else:
+        cts = ok_ts(cur) if cur else None
+        older = [r for r in releases(a.site) if ok_ts(r) and (cts is None or ok_ts(r) < cts) and str(r) != cur]
+        if not older: die("no earlier successful release to roll back to (use --to <release id>)")
+        target = max(older, key=ok_ts)
     switch(a.site, target); restart(a.site, d)
     code, _ = health(a.site, d)
     say(f"rolled back {a.site} to {target.name} (health {code})")
@@ -274,7 +354,12 @@ def cmd_status(a):
     if d["type"] in ("node", "python"):
         active = run(["systemctl", "--user", "is-active", f"site-{a.site}.service"], check=False).stdout.strip()
     code, url = health(a.site, d) if cur else (None, None)
-    say(json.dumps({**d, "current": os.path.basename(cur) if cur else None, "service": active, "health": code}, indent=2))
+    extra = {}
+    if d["type"] == "laravel":
+        for unit in ("queue.service", "schedule.timer"):
+            if (UNITS / f"site-{a.site}-{unit}").exists():
+                extra[unit.split(".")[0]] = run(["systemctl", "--user", "is-active", f"site-{a.site}-{unit}"], check=False).stdout.strip()
+    say(json.dumps({**d, "current": os.path.basename(cur) if cur else None, "service": active, "health": code, **extra}, indent=2))
     result(ok=True, site=a.site, current=os.path.basename(cur) if cur else None, service=active, health=str(code), releases=[r.name for r in releases(a.site)])
 
 
@@ -284,11 +369,24 @@ def cmd_put_env(a):
     data = sys.stdin.read()
     if not data.strip(): die("empty environment on stdin; refusing to overwrite shared/.env")
     shared = SITES / a.site / "shared"; shared.mkdir(parents=True, exist_ok=True)
-    tmp = shared / ".env.tmp"
+    tmp = shared / ".env.base.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f: f.write(data if data.endswith("\n") else data + "\n")
-    tmp.replace(shared / ".env")
-    say(f"wrote shared/.env for {a.site} ({len(data.splitlines())} lines)"); result(ok=True, site=a.site)
+    tmp.replace(shared / ".env.base"); build_env(a.site)
+    say(f"wrote shared/.env for {a.site} ({len(data.splitlines())} lines; DB_* come from the server)"); result(ok=True, site=a.site)
+
+
+def cmd_logs(a):
+    check_name(a.site); d = load(a.site); n = max(1, min(a.lines, 500))
+    say(f"== last {n} lines of app logs for {a.site}")
+    logs = sorted((SITES / a.site / "shared" / "storage" / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime) if d["type"] == "laravel" else []
+    if logs:
+        say(f"-- {logs[-1].name}"); say(run(["tail", "-n", str(n), str(logs[-1])]).stdout)
+    for unit in (f"site-{a.site}.service", f"site-{a.site}-queue.service", f"site-{a.site}-schedule.service"):
+        if (UNITS / unit).exists():
+            p = run(["journalctl", "--user", "-u", unit, "-n", str(n), "--no-pager", "-o", "short"], check=False)
+            say(f"-- {unit}"); say(p.stdout.strip() or "(no journal entries)")
+    result(ok=True, site=a.site)
 
 
 def cmd_list(a):
@@ -302,6 +400,7 @@ def cmd_unregister(a):
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "disable", "--now", f"site-{a.site}.service"], check=False)
         (UNITS / f"site-{a.site}.service").unlink(missing_ok=True); run(["systemctl", "--user", "daemon-reload"])
+    d2 = {**d, "queue": False, "scheduler": False}; sync_workers(a.site, d2)
     (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); reg_path(a.site).unlink(); caddy_reload()
     say(f"unregistered {a.site}"); result(ok=True, site=a.site)
 
@@ -312,12 +411,14 @@ def main():
     c = sp.add_parser("check-domain"); c.add_argument("--site", default=""); c.add_argument("domains", nargs="+"); c.set_defaults(f=cmd_check_domain)
     r = sp.add_parser("register"); r.add_argument("--site", required=True); r.add_argument("--type", required=True)
     r.add_argument("--domains", required=True); r.add_argument("--repo"); r.add_argument("--start"); r.add_argument("--root")
+    r.add_argument("--database", choices=["mysql"]); r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
     r.add_argument("--health-path", default="/"); r.add_argument("--hook", action="append"); r.add_argument("--http-only", action="store_true")
     r.set_defaults(f=cmd_register)
     x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)
     b = sp.add_parser("rollback"); b.add_argument("site"); b.add_argument("--to"); b.set_defaults(f=cmd_rollback)
     s = sp.add_parser("status"); s.add_argument("site"); s.set_defaults(f=cmd_status)
     sp.add_parser("list").set_defaults(f=cmd_list)
+    lg = sp.add_parser("logs"); lg.add_argument("site"); lg.add_argument("--lines", type=int, default=80); lg.set_defaults(f=cmd_logs)
     e = sp.add_parser("put-env"); e.add_argument("site"); e.set_defaults(f=cmd_put_env)
     u = sp.add_parser("unregister"); u.add_argument("site"); u.add_argument("--yes", action="store_true"); u.set_defaults(f=cmd_unregister)
     a = p.parse_args(); a.f(a)

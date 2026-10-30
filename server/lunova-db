@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""lunova-db: create (idempotently) a MariaDB database + user for a registered site.
+
+Root-owned; `deploy` may run ONLY `sudo lunova-db ensure <site>`. Prints DB_* lines on stdout.
+Passwords are kept root-side in /var/lib/lunova/db/<site>.pw and never written into deploy-owned paths.
+"""
+import hashlib, json, os, re, secrets, subprocess, sys
+from pathlib import Path
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
+REG = Path("/srv/registry/sites"); STATE = Path("/var/lib/lunova/db")
+
+
+def die(m): print(f"ERROR: {m}", file=sys.stderr); sys.exit(1)
+
+
+if len(sys.argv) != 3 or sys.argv[1] != "ensure": die("usage: lunova-db ensure <site>")
+site = sys.argv[2]
+if not NAME_RE.match(site): die("invalid site name")
+if not (REG / f"{site}.json").is_file(): die("site is not registered")
+if json.loads((REG / f"{site}.json").read_text()).get("database") != "mysql": die("site did not request a database")
+
+db = "app_" + site.replace("-", "_")
+user = db if len(db) <= 32 else db[:23] + "_" + hashlib.sha1(site.encode()).hexdigest()[:8]
+STATE.mkdir(parents=True, exist_ok=True); os.chmod(STATE, 0o700)
+pwf = STATE / f"{site}.pw"
+if pwf.exists(): pw = pwf.read_text().strip()
+else:
+    pw = secrets.token_hex(20)
+    fd = os.open(pwf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(pw + "\n")
+# skip-name-resolve is on, so 'localhost' does not match TCP connections from 127.0.0.1: grant both.
+sql = f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+for host in ("localhost", "127.0.0.1"):
+    sql += (f"CREATE USER IF NOT EXISTS '{user}'@'{host}' IDENTIFIED BY '{pw}';\n"
+            f"ALTER USER '{user}'@'{host}' IDENTIFIED BY '{pw}';\n"
+            f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{user}'@'{host}';\n")
+sql += "FLUSH PRIVILEGES;\n"
+p = subprocess.run(["mariadb"], input=sql, text=True, capture_output=True)
+if p.returncode != 0: die("mariadb failed: " + p.stderr.strip())
+print(f"DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\nDB_DATABASE={db}\nDB_USERNAME={user}\nDB_PASSWORD={pw}")
