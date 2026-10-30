@@ -16,22 +16,21 @@ mkdir -p ~/.claude/skills && ln -s ~/lunova-deploy/skills/lunova-deploy ~/.claud
 Then, inside your project, tell Claude Code: **"deploy this project to Lunova"** (or `/lunova-deploy`).
 You need: `gh` logged in with access to your repo, push rights. You do NOT need SSH access, keys or ops rights.
 
-## For ops: setup state
-Done: repo `lunova-digital/lunova-deploy` (**public**: it holds no secrets, and public is what lets private repos on the Free plan call it); server platform (PHP 8.3 + FPM pool `lunova`, Composer, Node 22, MariaDB, 4 GB swap); `lunova-site`, `lunova-db`, `lunova-shell` installed; registry `/srv/registry`; the deploy key is locked to `lunova-shell` (forced command, no shell, no PTY).
-
-**Per project (GitHub Free: org secrets do not reach private repos, so secrets are per repo):**
-```
-ops/lunova-onboard [-p <mgit profile>] owner/repo     # sets LUNOVA_DEPLOY_KEY, LUNOVA_HOST, LUNOVA_HOST_FPR on that repo
-```
-Run it yourself from the ops machine; the developer never sees the key. The developer (or the skill) then sets the repo secret `LUNOVA_ENV`.
-Tag `v1` after changes to the workflow are merged. Reinstall server tools after editing:
-`scp server/lunova-site server/lunova-shell lunova:/tmp/ && ssh lunova 'sudo install -m 755 -o root -g root /tmp/lunova-site /tmp/lunova-shell /usr/local/bin/'` (and `server/lunova-db` into `/usr/local/sbin/`).
+## For ops: how access works (no keys, no secrets, no per-repo setup)
+- The shared workflow (public, no secrets) proves its identity with GitHub's **OIDC token**. On the server `lunova-gate` (forced command for runner logins) verifies the signature against GitHub's keys, the audience `lunova`, expiry, that the owner is in `/srv/registry/config.json` `allowed_owners` (**name and numeric id**: `lunova-digital`, `jakiurcore`), and that it was called from `lunova-digital/lunova-deploy/.github/workflows/deploy.yml`. Then only `lunova-site ...` or an rsync into `/srv/sites/<site>/releases/<id>/` of a site bound to that repo and branch can run.
+- One-time enablement: `ops/enable-gate` (adds the sshd `AuthorizedKeysCommand` for user `deploy`: any throwaway ed25519 key may open a session, but only into the gate). Undo: remove `/etc/ssh/sshd_config.d/99-lunova.conf` and reload ssh.
+- **Allowed owners** are edited in `/srv/registry/config.json`. Gate decisions are logged to `/srv/registry/gate.log`; package installs to `/var/log/lunova-provision.log`.
+- **Provisioning**: `lunova-site release` installs missing PHP extensions (from composer's platform check), the DB driver/engine and manifest `packages:` through `sudo lunova-provision` (root helper; refuses system/security/container/web-server packages). Databases are created by `sudo lunova-db ensure <site>` (MariaDB or PostgreSQL); passwords are generated and kept root-side.
+- **Sealed env**: `scripts/lunova-seal` encrypts values with the server's public key (`skills/lunova-deploy/seal.pub.pem`; the private key is `/var/lib/lunova/seal/private.pem`, owner deploy, mode 600). The sealed file is committed in the project.
+- Server tools: `server/lunova-site`, `lunova-gate`, `lunova-authkeys` -> `/usr/local/bin`; `lunova-provision`, `lunova-db` -> `/usr/local/sbin`. Reinstall after editing with `scp` + `sudo install -m 755 -o root -g root`. Tag `v2` after workflow changes are merged.
 
 ## Known limits
-- The deploy key is shared by all deploying repos. It is restricted to `lunova-site` and rsync into `/srv/sites/*/releases/*`, but anyone who can write a workflow in an onboarded repo can still deploy to any site name. Only onboard repos you trust.
-- Sites are bound to the first repo that registers them, but release uploads are not authenticated per repo.
-- Upgrading to GitHub Team would allow org-level secrets and a private workflow repo; nothing else would need to change.
+- Anyone who can push to the deploy branch of an allowed-owner repo deploys that site. Protect the branch in GitHub if that matters.
+- Owners are trusted: a `packages:` entry or a hook in a repo of an allowed owner runs on the server as that site's deploy.
+- GitHub Free: OIDC works on every plan, and a public workflow repo is what lets private repos call it.
 
 ## Test status
-- `server/lunova-site` + `lunova-db`: tested live as `deploy`: register/release/rollback (healthy-release markers), hook failure leaves the site untouched, failed health check auto-rolls back, repo hijack/duplicate domain/bad name refused, put-env, database provisioning (PDO login over 127.0.0.1), queue worker and scheduler timer, logs, Cloudflare-aware domain check. Full dry run of the real Laravel app (composer install --no-dev, migrate on MariaDB, health 200). Survived a server reboot.
-- `.github/workflows/deploy.yml`: YAML valid; **not yet executed on GitHub** (needs `lunova-onboard` run on a repo).
+- Tested live on the server (simulated verified identity): site/repo/branch binding (other repo, other branch and PR refs refused), sealed env (apply once, DB_* refused, wrong repo refused, names-only status), automatic provisioning (PHP DB driver, apt package, `openssh-server` refused), MariaDB and PostgreSQL creation with generated passwords (real TCP login), Laravel env seeding (production defaults, generated APP_KEY, `.env.example` keys), release + health check.
+- `lunova-gate` token verification unit-tested: valid token accepted; expired, wrong audience/issuer, owner not allowed, right name but wrong owner id, custom workflow, forged signature and unknown key all refused.
+- Earlier (v1 era): rollback with healthy-release markers, hook failure leaves the site untouched, auto-rollback on failed health check, queue worker and scheduler, survived a reboot.
+- **Not yet run end to end on GitHub:** v2 needs `ops/enable-gate` on the server and a repo owned by `lunova-digital` or `jakiurcore`.

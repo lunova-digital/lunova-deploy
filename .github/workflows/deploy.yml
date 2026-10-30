@@ -1,5 +1,7 @@
-# Reusable Lunova deploy workflow. Lives in <ORG>/lunova-deploy at .github/workflows/deploy.yml.
-# Developers never see the SSH key: it is a repo secret (LUNOVA_DEPLOY_KEY) that ops sets with ops/lunova-onboard.
+# Reusable Lunova deploy workflow (v2). Public on purpose: it contains no secrets.
+# There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
+# (lunova-gate) only accepts repositories owned by an allowed owner, running THIS workflow, and binds each site to the
+# repository and branch that first registered it.
 name: lunova-deploy
 
 on:
@@ -20,19 +22,16 @@ on:
         description: "Log lines to show in logs mode"
         type: string
         default: "80"
-    secrets:
-      LUNOVA_DEPLOY_KEY:
-        required: true
-      LUNOVA_ENV:
-        required: false
 
+# The caller must grant id-token: write (the template does).
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   lunova:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     concurrency:
       group: lunova-${{ github.repository }}
       cancel-in-progress: false
@@ -41,8 +40,8 @@ jobs:
       MANIFEST: ${{ inputs.manifest }}
       ROLLBACK_TO: ${{ inputs.rollback_to }}
       LOG_LINES: ${{ inputs.lines }}
-      LUNOVA_HOST: ${{ vars.LUNOVA_HOST }}
-      LUNOVA_HOST_FPR: ${{ vars.LUNOVA_HOST_FPR }}
+      LUNOVA_HOST: 152.42.168.192
+      LUNOVA_HOST_FPR: SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +49,6 @@ jobs:
         run: |
           set -euo pipefail
           [ -f "$MANIFEST" ] || { echo "::error::$MANIFEST not found. Run the lunova-deploy skill to create it."; exit 1; }
-          [ -n "$LUNOVA_HOST" ] && [ -n "$LUNOVA_HOST_FPR" ] || { echo "::error::Repo variables LUNOVA_HOST / LUNOVA_HOST_FPR are missing. Ask ops to run lunova-onboard for this repo."; exit 1; }
           {
             echo "SITE=$(yq -r '.site' "$MANIFEST")"
             echo "TYPE=$(yq -r '.type' "$MANIFEST")"
@@ -64,26 +62,41 @@ jobs:
             echo "KEEP_NODE_MODULES=$(yq -r '.include_node_modules // false' "$MANIFEST")"
           } >> "$GITHUB_ENV"
 
-      - name: Configure SSH (pinned host key)
-        env:
-          KEY: ${{ secrets.LUNOVA_DEPLOY_KEY }}
+      - name: Connect (pinned host key, GitHub OIDC identity)
         run: |
           set -euo pipefail
-          install -d -m 700 ~/.ssh
-          (umask 077; printf '%s\n' "$KEY" > ~/.ssh/lunova_key)
+          install -d -m 700 ~/.ssh ~/.lunova
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/lunova_key          # throwaway key for this run only
           ssh-keyscan -t ed25519 "$LUNOVA_HOST" > ~/.ssh/known_hosts 2>/dev/null
           ssh-keygen -lf ~/.ssh/known_hosts | grep -qF "$LUNOVA_HOST_FPR" \
             || { echo "::error::Server host key does not match the pinned fingerprint. Refusing to connect."; exit 1; }
           printf 'Host lunova\n  HostName %s\n  User deploy\n  IdentityFile ~/.ssh/lunova_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile ~/.ssh/known_hosts\n' "$LUNOVA_HOST" > ~/.ssh/config
-          ssh -o BatchMode=yes lunova lunova-site list >/dev/null
+          # token: a fresh short-lived OIDC token per call (builds can outlast one token)
+          cat > ~/.lunova/token <<'EOS'
+          #!/bin/bash
+          set -e
+          curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=lunova" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["value"])'
+          EOS
+          # lsh <command> [args...]: run a command on the server through the gate (args are quoted safely; stdin is forwarded)
+          cat > ~/.lunova/lsh <<'EOS'
+          #!/bin/bash
+          set -e
+          tok=$("$HOME/.lunova/token")
+          exec ssh -o BatchMode=yes lunova "LUNOVA_TOKEN=$tok $(printf '%q ' "$@")"
+          EOS
+          chmod 700 ~/.lunova/token ~/.lunova/lsh
+          [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || { echo "::error::No OIDC token available. The caller workflow must set 'permissions: id-token: write'."; exit 1; }
+          ~/.lunova/lsh lunova-site list > /dev/null \
+            || { echo "::error::The server refused this run. It only accepts repositories owned by lunova-digital or jakiurcore, running the shared Lunova workflow."; exit 1; }
 
       - name: Preflight (capabilities and domains)
         if: env.MODE == 'check'
         run: |
           set -uo pipefail
-          ssh lunova lunova-site capabilities
+          ~/.lunova/lsh lunova-site capabilities
           IFS=, read -ra D <<< "$DOMAINS"
-          ssh lunova lunova-site check-domain --site "$SITE" "${D[@]}"
+          ~/.lunova/lsh lunova-site check-domain --site "$SITE" "${D[@]}"
           rc=$?
           [ $rc -eq 0 ] && echo "::notice::Preflight passed" || echo "::warning::Domain problems above (DNS may still be propagating)"
 
@@ -91,14 +104,14 @@ jobs:
         if: env.MODE == 'status'
         run: |
           set -euo pipefail
-          ssh lunova "lunova-site status $SITE"
+          ~/.lunova/lsh lunova-site status "$SITE"
 
       - name: Logs
         if: env.MODE == 'logs'
         run: |
           set -euo pipefail
           [[ "$LOG_LINES" =~ ^[0-9]+$ ]] || LOG_LINES=80
-          ssh lunova "lunova-site logs $SITE --lines $LOG_LINES"
+          ~/.lunova/lsh lunova-site logs "$SITE" --lines "$LOG_LINES"
 
       - name: Roll back
         if: env.MODE == 'rollback'
@@ -106,7 +119,7 @@ jobs:
           set -euo pipefail
           args=(lunova-site rollback "$SITE")
           [ -n "$ROLLBACK_TO" ] && args+=(--to "$ROLLBACK_TO")
-          ssh lunova "$(printf '%q ' "${args[@]}")"
+          ~/.lunova/lsh "${args[@]}"
 
       - uses: shivammathur/setup-php@v2
         if: env.MODE == 'deploy' && env.PHP_VERSION != ''
@@ -135,17 +148,19 @@ jobs:
           fi
           for c in "${cmds[@]}"; do echo "::group::$c"; bash -euo pipefail -c "$c"; echo "::endgroup::"; done
 
-      - name: Register site (idempotent)
+      - name: Register site (idempotent; database and packages are provisioned on the server)
         if: env.MODE == 'deploy'
         run: |
           set -euo pipefail
-          args=(lunova-site register --site "$SITE" --type "$TYPE" --domains "$DOMAINS" --repo "$GITHUB_REPOSITORY" --health-path "$HEALTH")
+          args=(lunova-site register --site "$SITE" --type "$TYPE" --domains "$DOMAINS" --health-path "$HEALTH")
           [ -n "$ROOT" ] && args+=(--root "$ROOT")
           [ -n "$START" ] && args+=(--start "$START")
           [ "$HTTP_ONLY" = "true" ] && args+=(--http-only)
-          [ "$(yq -r '.database // ""' "$MANIFEST")" = "mysql" ] && args+=(--database mysql)
+          db=$(yq -r '.database // ""' "$MANIFEST")
+          case "$db" in mysql|postgres|sqlite) args+=(--database "$db") ;; ""|none) ;; *) echo "::error::database must be mysql, postgres, sqlite or none (got '$db')"; exit 1 ;; esac
           [ "$(yq -r '.queue // false' "$MANIFEST")" = "true" ] && args+=(--queue)
           [ "$(yq -r '.scheduler // false' "$MANIFEST")" = "true" ] && args+=(--scheduler)
+          while IFS= read -r pkg; do [ -n "$pkg" ] && args+=(--package "$pkg"); done < <(yq -r '.packages // [] | .[]' "$MANIFEST")
           if [ "$(yq -r 'has("hooks")' "$MANIFEST")" = "true" ]; then
             if [ "$(yq -r '.hooks | length' "$MANIFEST")" = "0" ]; then
               args+=(--hook true)   # hooks: [] means "run none"
@@ -153,36 +168,36 @@ jobs:
               while IFS= read -r h; do args+=(--hook "$h"); done < <(yq -r '.hooks[]' "$MANIFEST")
             fi
           fi
-          ssh lunova "$(printf '%q ' "${args[@]}")"
+          ~/.lunova/lsh "${args[@]}"
 
-      - name: Deliver environment
+      - name: Apply sealed environment (.lunova/env.sealed)
         if: env.MODE == 'deploy'
-        env:
-          APP_ENV_FILE: ${{ secrets.LUNOVA_ENV }}
         run: |
           set -euo pipefail
-          if [ -n "${APP_ENV_FILE:-}" ]; then
-            printf '%s\n' "$APP_ENV_FILE" | ssh lunova "lunova-site put-env $SITE"
+          if [ -f .lunova/env.sealed ]; then
+            ~/.lunova/lsh lunova-site apply-env "$SITE" < .lunova/env.sealed
           else
-            echo "No LUNOVA_ENV secret set: keeping the existing shared/.env on the server."
+            echo "No .lunova/env.sealed: the server builds .env from .env.example, its own defaults and generated database credentials."
           fi
 
       - name: Upload release
         if: env.MODE == 'deploy'
         run: |
           set -euo pipefail
-          echo "RELEASE_ID=${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           ID="${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}"
-          ex=(--exclude .git --exclude .github --exclude '.env' --exclude '.env.*' --exclude '.lunova.yml')
+          echo "RELEASE_ID=$ID" >> "$GITHUB_ENV"
+          # .env.example is uploaded (the server seeds the app's .env from it); real env files and Lunova files are not
+          ex=(--include '.env.example' --exclude .git --exclude .github --exclude '.env' --exclude '.env.*' --exclude .lunova --exclude .lunova.yml)
           [ "$KEEP_NODE_MODULES" = "true" ] || ex+=(--exclude node_modules)
           while IFS= read -r e; do [ -n "$e" ] && ex+=(--exclude "$e"); done < <(yq -r '.exclude // [] | .[]' "$MANIFEST")
-          rsync -az --delete --mkpath "${ex[@]}" -e ssh ./ "lunova:/srv/sites/$SITE/releases/$ID/"
+          rsync -az --delete --mkpath "${ex[@]}" -e "ssh -o BatchMode=yes" --rsync-path "LUNOVA_TOKEN=$(~/.lunova/token) rsync" \
+            ./ "lunova:/srv/sites/$SITE/releases/$ID/"
 
-      - name: Release (hooks, switch, health check, auto-rollback)
+      - name: Release (packages, hooks, switch, health check, auto-rollback)
         if: env.MODE == 'deploy'
         run: |
           set -euo pipefail
-          ssh lunova "lunova-site release $SITE $RELEASE_ID" | tee release.log
+          ~/.lunova/lsh lunova-site release "$SITE" "$RELEASE_ID" | tee release.log
           {
             echo "### Lunova deploy: $SITE"
             echo "- Release: \`$RELEASE_ID\`"

@@ -1,12 +1,15 @@
 # Ops requests (copy-paste messages)
 
-Give the developer the matching message to send to the Lunova ops person. Fill the `<...>`. Never ask ops for keys: ops sets the repo's secret, developers never receive it.
+Give the developer the matching message to send to the Lunova ops person. Fill the `<...>`. Ops is rarely needed: keys, secrets, databases, passwords and packages are all handled by the pipeline. Never ask ops for keys.
 
-## 0. / 1. Repo is not onboarded (missing LUNOVA_DEPLOY_KEY / LUNOVA_HOST / LUNOVA_HOST_FPR)
-> Please onboard `<owner/repo>` for Lunova deploys: run `lunova-deploy/ops/lunova-onboard <owner/repo>` (it sets repo secret `LUNOVA_DEPLOY_KEY` and variables `LUNOVA_HOST`, `LUNOVA_HOST_FPR`). The repo's admin must be able to add secrets, and the repo may be private.
+## 0. Repo owner is not allowed
+Not an ops message: the server accepts only repos owned by `lunova-digital` or `jakiurcore`. Tell the developer to transfer (`gh api repos/<owner>/<repo>/transfer -f new_owner=lunova-digital`, needs admin on the repo and org membership) or fork the repo into `lunova-digital`, then continue.
+
+## 1. Move a site to another branch (or rename the repo it is bound to)
+> Site `<site>` is bound to `<owner/repo>` branch `<old>`. Please re-bind it to branch `<new>`: edit `branch` in `/srv/registry/sites/<site>.json` (and `repo` if the repo was renamed/transferred).
 
 ## 2. Runtime missing (from `mode=check`)
-> Site `<site>` (<type>) needs `<php 8.3 + FPM pool 'lunova' as user deploy, socket /run/php/lunova.sock, composer | node <version> | ...>` on the Lunova server. Capabilities output: `<paste the capabilities lines>`.
+> Site `<site>` (<type>) needs something the pipeline cannot install by itself (`<PHP other than 8.3 | Node other than 22 | a package apt refused: name + message>`). Capabilities / error output: `<paste the lines>`.
 
 ## 3. DNS
 > Please point `<domain>` (and `www.<domain>`) A record to `152.42.168.192`. If the zone is on Cloudflare: set the record to **DNS-only (grey cloud)** until the first HTTPS deploy has issued the certificate, then enable the proxy and set SSL mode to Full (strict). Needed before the first HTTPS deploy.

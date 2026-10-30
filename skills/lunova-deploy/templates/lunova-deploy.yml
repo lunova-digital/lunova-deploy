@@ -22,8 +22,10 @@ on:
         type: string
         default: "80"
 
+# id-token: write lets the run prove its identity to the Lunova server (GitHub OIDC). There are no keys or secrets to set up.
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   lunova:
@@ -32,7 +34,3 @@ jobs:
       mode: ${{ github.event_name == 'pull_request' && 'check' || inputs.mode || 'deploy' }}
       rollback_to: ${{ inputs.rollback_to || '' }}
       lines: ${{ inputs.lines || '80' }}
-    # Explicit, not `inherit`: inherit only works inside one org, and this workflow lives in another.
-    secrets:
-      LUNOVA_DEPLOY_KEY: ${{ secrets.LUNOVA_DEPLOY_KEY }}
-      LUNOVA_ENV: ${{ secrets.LUNOVA_ENV }}

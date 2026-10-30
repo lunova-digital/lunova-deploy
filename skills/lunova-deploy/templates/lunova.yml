@@ -13,7 +13,8 @@ domains:
 #   - composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
 # hooks:                      # commands run on the server inside the new release BEFORE it goes live
 #   - php artisan migrate --force   # (omit the key for per-type defaults; use [] for none)
-# database: mysql            # server-provisioned MariaDB; DB_* injected, never in LUNOVA_ENV
+# database: mysql            # mysql | postgres | sqlite | none. The server creates it and injects DB_*; nobody chooses a password
+# packages: [ffmpeg]          # extra apt packages this project needs (PHP extensions and the DB engine are installed automatically)
 # queue: true                 # laravel: queue worker service
 # scheduler: true             # laravel: schedule:run every minute
 # health_path: /              # must answer 2xx/3xx or the release is rolled back automatically
