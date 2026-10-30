@@ -1,12 +1,9 @@
 # Ops requests (copy-paste messages)
 
-Give the developer the matching message to send to the Lunova ops person. Fill the `<...>`. Never ask ops for keys: ops sets org-level secrets, developers never receive them.
+Give the developer the matching message to send to the Lunova ops person. Fill the `<...>`. Never ask ops for keys: ops sets the repo's secret, developers never receive it.
 
-## 0. One-time Lunova setup (only if the org repo/secret/variables are missing)
-> Please set up the shared deploy workflow for our org: (1) create `<ORG>/lunova-deploy` with `.github/workflows/deploy.yml` from the lunova-deploy repo and tag `v1`; allow other org repos to use it (Actions > General > Access); (2) org secret `LUNOVA_DEPLOY_KEY` (private key of the server's `deploy` user) shared with the repos that deploy; (3) org variables `LUNOVA_HOST=152.42.168.192` and `LUNOVA_HOST_FPR=<fingerprint from config.yml>`.
-
-## 1. Repo cannot see the org secrets/variables
-> Repo `<org/repo>` needs access to org secret `LUNOVA_DEPLOY_KEY` and variables `LUNOVA_HOST`, `LUNOVA_HOST_FPR` (and permission to call `<ORG>/lunova-deploy`).
+## 0. / 1. Repo is not onboarded (missing LUNOVA_DEPLOY_KEY / LUNOVA_HOST / LUNOVA_HOST_FPR)
+> Please onboard `<owner/repo>` for Lunova deploys: run `lunova-deploy/ops/lunova-onboard <owner/repo>` (it sets repo secret `LUNOVA_DEPLOY_KEY` and variables `LUNOVA_HOST`, `LUNOVA_HOST_FPR`). The repo's admin must be able to add secrets, and the repo may be private.
 
 ## 2. Runtime missing (from `mode=check`)
 > Site `<site>` (<type>) needs `<php 8.3 + FPM pool 'lunova' as user deploy, socket /run/php/lunova.sock, composer | node <version> | ...>` on the Lunova server. Capabilities output: `<paste the capabilities lines>`.

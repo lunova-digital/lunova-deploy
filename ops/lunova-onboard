@@ -1,0 +1,21 @@
+#!/bin/bash
+# lunova-onboard: ops-only. Give one repo what it needs to deploy to Lunova (repo secrets + variables).
+#   ops/lunova-onboard owner/repo                 # uses the gh account that can admin the repo
+#   ops/lunova-onboard -p work owner/repo         # via mgh with an mgit profile
+# Reads the deploy key from $LUNOVA_KEY_FILE (default ~/.ssh/lunova_deploy). Never prints it.
+# Run it yourself; developers never get the key. The key is restricted server-side to lunova-site + rsync.
+set -euo pipefail
+HOST="${LUNOVA_HOST:-152.42.168.192}"
+FPR="${LUNOVA_HOST_FPR:-SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s}"
+KEY="${LUNOVA_KEY_FILE:-$HOME/.ssh/lunova_deploy}"
+
+GH=(gh)
+if [ "${1:-}" = "-p" ]; then command -v mgh >/dev/null || { echo "mgh not found" >&2; exit 1; }; GH=(mgh -p "$2"); shift 2; fi
+REPO="${1:?usage: lunova-onboard [-p profile] owner/repo}"
+[ -r "$KEY" ] || { echo "deploy key not readable: $KEY" >&2; exit 1; }
+
+"${GH[@]}" repo view "$REPO" >/dev/null
+"${GH[@]}" secret set LUNOVA_DEPLOY_KEY --repo "$REPO" < "$KEY"
+"${GH[@]}" variable set LUNOVA_HOST --repo "$REPO" --body "$HOST"
+"${GH[@]}" variable set LUNOVA_HOST_FPR --repo "$REPO" --body "$FPR"
+echo "OK: $REPO can deploy to $HOST. Still needed per app: repo secret LUNOVA_ENV (production .env)."

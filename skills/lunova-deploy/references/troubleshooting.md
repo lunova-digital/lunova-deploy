@@ -2,9 +2,9 @@
 
 | Message | Cause | Fix |
 |---|---|---|
-| `Org variables LUNOVA_HOST / LUNOVA_HOST_FPR are not visible` | repo not granted org vars | ops request #1 |
+| `Repo variables LUNOVA_HOST / LUNOVA_HOST_FPR are missing` | repo not onboarded | ops request #1 |
 | `Server host key does not match the pinned fingerprint` | server rebuilt or MITM | stop; tell ops, do not bypass |
-| `Permission denied (publickey)` | org secret missing/not shared with this repo | ops request #1 |
+| `Permission denied (publickey)` | repo secret LUNOVA_DEPLOY_KEY missing (repo not onboarded) | ops request #1 |
 | `invalid site name` / `domain ... already used by site` | manifest | change `site`/`domains` |
 | `site '<x>' belongs to repo ...` | name taken by another repo | choose another `site` |
 | `PHP-FPM socket ... not found` | no PHP-FPM on server | ops request #2 |

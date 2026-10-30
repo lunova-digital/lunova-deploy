@@ -1,5 +1,5 @@
 # Reusable Lunova deploy workflow. Lives in <ORG>/lunova-deploy at .github/workflows/deploy.yml.
-# Developers never see the SSH key: it is an ORG secret (LUNOVA_DEPLOY_KEY) set once by ops.
+# Developers never see the SSH key: it is a repo secret (LUNOVA_DEPLOY_KEY) that ops sets with ops/lunova-onboard.
 name: lunova-deploy
 
 on:
@@ -50,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -f "$MANIFEST" ] || { echo "::error::$MANIFEST not found. Run the lunova-deploy skill to create it."; exit 1; }
-          [ -n "$LUNOVA_HOST" ] && [ -n "$LUNOVA_HOST_FPR" ] || { echo "::error::Org variables LUNOVA_HOST / LUNOVA_HOST_FPR are not visible to this repo. Ask ops."; exit 1; }
+          [ -n "$LUNOVA_HOST" ] && [ -n "$LUNOVA_HOST_FPR" ] || { echo "::error::Repo variables LUNOVA_HOST / LUNOVA_HOST_FPR are missing. Ask ops to run lunova-onboard for this repo."; exit 1; }
           {
             echo "SITE=$(yq -r '.site' "$MANIFEST")"
             echo "TYPE=$(yq -r '.type' "$MANIFEST")"

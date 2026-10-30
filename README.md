@@ -17,19 +17,21 @@ Then, inside your project, tell Claude Code: **"deploy this project to Lunova"**
 You need: `gh` logged in with access to your repo, push rights. You do NOT need SSH access, keys or ops rights.
 
 ## For ops: setup state
-Done: repo `lunova-digital/lunova-deploy` (private); server platform (PHP 8.3 + FPM pool `lunova`, Composer, Node 22, MariaDB); `lunova-site` and `lunova-db` installed (`/usr/local/bin`, `/usr/local/sbin`) with sudoers for `deploy`; registry `/srv/registry`.
-Still needed once (GitHub Free plan: verify these work for private repos, see Known limits):
-1. Org secret `LUNOVA_DEPLOY_KEY` = private key of the server's `deploy` user (`~/.ssh/lunova_deploy` on the ops machine), visibility `private` (or selected repos).
-2. Org variables `LUNOVA_HOST=152.42.168.192`, `LUNOVA_HOST_FPR=SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s`.
-3. Settings > Actions > General > Access: allow repositories in the organization to use workflows from this repo.
-4. Tag `v1` after changes to the workflow are merged.
-Reinstall server tools after editing: `scp server/lunova-site server/lunova-db lunova:/tmp/ && ssh lunova 'sudo install -m 755 -o root -g root /tmp/lunova-site /usr/local/bin/ && sudo install -m 755 -o root -g root /tmp/lunova-db /usr/local/sbin/'`.
+Done: repo `lunova-digital/lunova-deploy` (**public**: it holds no secrets, and public is what lets private repos on the Free plan call it); server platform (PHP 8.3 + FPM pool `lunova`, Composer, Node 22, MariaDB, 4 GB swap); `lunova-site`, `lunova-db`, `lunova-shell` installed; registry `/srv/registry`; the deploy key is locked to `lunova-shell` (forced command, no shell, no PTY).
+
+**Per project (GitHub Free: org secrets do not reach private repos, so secrets are per repo):**
+```
+ops/lunova-onboard [-p <mgit profile>] owner/repo     # sets LUNOVA_DEPLOY_KEY, LUNOVA_HOST, LUNOVA_HOST_FPR on that repo
+```
+Run it yourself from the ops machine; the developer never sees the key. The developer (or the skill) then sets the repo secret `LUNOVA_ENV`.
+Tag `v1` after changes to the workflow are merged. Reinstall server tools after editing:
+`scp server/lunova-site server/lunova-shell lunova:/tmp/ && ssh lunova 'sudo install -m 755 -o root -g root /tmp/lunova-site /tmp/lunova-shell /usr/local/bin/'` (and `server/lunova-db` into `/usr/local/sbin/`).
 
 ## Known limits
-- The deploy key is shared by all deploying repos. Anyone who can write a workflow in a repo with access can use it. Acceptable for a private team; tighten later with an SSH forced command that only allows `lunova-site` and rsync into `/srv/sites/*/releases`.
+- The deploy key is shared by all deploying repos. It is restricted to `lunova-site` and rsync into `/srv/sites/*/releases/*`, but anyone who can write a workflow in an onboarded repo can still deploy to any site name. Only onboard repos you trust.
 - Sites are bound to the first repo that registers them, but release uploads are not authenticated per repo.
-- GitHub Free: org secrets for private repos and sharing workflows from a private repo may require a paid plan. If the first run reports the secret/workflow is not accessible, either upgrade the org plan or set `LUNOVA_DEPLOY_KEY` per repo and make `lunova-deploy` public (it contains no secrets, only the server IP and host fingerprint).
+- Upgrading to GitHub Team would allow org-level secrets and a private workflow repo; nothing else would need to change.
 
 ## Test status
 - `server/lunova-site` + `lunova-db`: tested live as `deploy`: register/release/rollback (healthy-release markers), hook failure leaves the site untouched, failed health check auto-rolls back, repo hijack/duplicate domain/bad name refused, put-env, database provisioning (PDO login over 127.0.0.1), queue worker and scheduler timer, logs, Cloudflare-aware domain check. Full dry run of the real Laravel app (composer install --no-dev, migrate on MariaDB, health 200). Survived a server reboot.
-- `.github/workflows/deploy.yml`: YAML valid; **not yet executed on GitHub** (needs the org secret and variables).
+- `.github/workflows/deploy.yml`: YAML valid; **not yet executed on GitHub** (needs `lunova-onboard` run on a repo).

@@ -1,12 +1,12 @@
 # Lunova deploy configuration. Maintained by ops; developers do not edit this.
 server_ip: 152.42.168.192
 host_fingerprint: SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s
-# Shared workflow repo (private, org: lunova-digital). Developer repos that deploy must live in this org to see the org secret/variables.
+# Shared workflow repo (public on purpose: private repos on GitHub Free can only call a public reusable workflow; it holds no secrets).
 workflow_repo: lunova-digital/lunova-deploy
 workflow_ref: v1
-# Org-level secret/variable names that ops sets. Developers never see their values.
-org_secret: LUNOVA_DEPLOY_KEY
-org_variables: [LUNOVA_HOST, LUNOVA_HOST_FPR]
+# Repo-level secret/variable names that ops sets with ops/lunova-onboard. Developers never see their values.
+deploy_secret: LUNOVA_DEPLOY_KEY
+deploy_variables: [LUNOVA_HOST, LUNOVA_HOST_FPR]
 # Repo-level secret a developer sets: the app's production .env contents.
 repo_secret_env: LUNOVA_ENV
 supported_types: [static, spa, node, python, laravel]
