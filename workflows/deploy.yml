@@ -1,0 +1,169 @@
+# Reusable Lunova deploy workflow. Lives in <ORG>/lunova-deploy at .github/workflows/deploy.yml.
+# Developers never see the SSH key: it is an ORG secret (LUNOVA_DEPLOY_KEY) set once by ops.
+name: lunova-deploy
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "deploy | check | rollback"
+        type: string
+        default: deploy
+      manifest:
+        type: string
+        default: .lunova.yml
+      rollback_to:
+        description: "Release id to roll back to (empty = previous release)"
+        type: string
+        default: ""
+    secrets:
+      LUNOVA_DEPLOY_KEY:
+        required: true
+      LUNOVA_ENV:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lunova:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: lunova-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      MODE: ${{ inputs.mode }}
+      MANIFEST: ${{ inputs.manifest }}
+      ROLLBACK_TO: ${{ inputs.rollback_to }}
+      LUNOVA_HOST: ${{ vars.LUNOVA_HOST }}
+      LUNOVA_HOST_FPR: ${{ vars.LUNOVA_HOST_FPR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read manifest
+        run: |
+          set -euo pipefail
+          [ -f "$MANIFEST" ] || { echo "::error::$MANIFEST not found. Run the lunova-deploy skill to create it."; exit 1; }
+          [ -n "$LUNOVA_HOST" ] && [ -n "$LUNOVA_HOST_FPR" ] || { echo "::error::Org variables LUNOVA_HOST / LUNOVA_HOST_FPR are not visible to this repo. Ask ops."; exit 1; }
+          {
+            echo "SITE=$(yq -r '.site' "$MANIFEST")"
+            echo "TYPE=$(yq -r '.type' "$MANIFEST")"
+            echo "DOMAINS=$(yq -r '.domains | join(",")' "$MANIFEST")"
+            echo "ROOT=$(yq -r '.root // ""' "$MANIFEST")"
+            echo "START=$(yq -r '.start // ""' "$MANIFEST")"
+            echo "HEALTH=$(yq -r '.health_path // "/"' "$MANIFEST")"
+            echo "HTTP_ONLY=$(yq -r '.http_only // false' "$MANIFEST")"
+            echo "PHP_VERSION=$(yq -r '.php // ""' "$MANIFEST")"
+            echo "NODE_VERSION=$(yq -r '.node // ""' "$MANIFEST")"
+            echo "KEEP_NODE_MODULES=$(yq -r '.include_node_modules // false' "$MANIFEST")"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure SSH (pinned host key)
+        env:
+          KEY: ${{ secrets.LUNOVA_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          (umask 077; printf '%s\n' "$KEY" > ~/.ssh/lunova_key)
+          ssh-keyscan -t ed25519 "$LUNOVA_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          ssh-keygen -lf ~/.ssh/known_hosts | grep -qF "$LUNOVA_HOST_FPR" \
+            || { echo "::error::Server host key does not match the pinned fingerprint. Refusing to connect."; exit 1; }
+          printf 'Host lunova\n  HostName %s\n  User deploy\n  IdentityFile ~/.ssh/lunova_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile ~/.ssh/known_hosts\n' "$LUNOVA_HOST" > ~/.ssh/config
+          ssh -o BatchMode=yes lunova true
+
+      - name: Preflight (capabilities and domains)
+        if: env.MODE == 'check'
+        run: |
+          set -uo pipefail
+          ssh lunova lunova-site capabilities
+          IFS=, read -ra D <<< "$DOMAINS"
+          ssh lunova lunova-site check-domain --site "$SITE" "${D[@]}"
+          rc=$?
+          [ $rc -eq 0 ] && echo "::notice::Preflight passed" || echo "::warning::Domain problems above (DNS may still be propagating)"
+
+      - name: Roll back
+        if: env.MODE == 'rollback'
+        run: |
+          set -euo pipefail
+          args=(lunova-site rollback "$SITE")
+          [ -n "$ROLLBACK_TO" ] && args+=(--to "$ROLLBACK_TO")
+          ssh lunova "$(printf '%q ' "${args[@]}")"
+
+      - uses: shivammathur/setup-php@v2
+        if: env.MODE == 'deploy' && env.PHP_VERSION != ''
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          tools: composer:v2
+
+      - uses: actions/setup-node@v4
+        if: env.MODE == 'deploy' && env.NODE_VERSION != ''
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build
+        if: env.MODE == 'deploy'
+        run: |
+          set -euo pipefail
+          n=$(yq -r '.build // [] | length' "$MANIFEST")
+          if [ "$n" -eq 0 ]; then
+            case "$TYPE" in
+              laravel) cmds=("composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction") ;;
+              node|spa|static) cmds=("[ ! -f package.json ] || npm ci" "[ ! -f package.json ] || npm run build --if-present") ;;
+              python) cmds=() ;;
+            esac
+          else
+            mapfile -t cmds < <(yq -r '.build[]' "$MANIFEST")
+          fi
+          for c in "${cmds[@]}"; do echo "::group::$c"; bash -euo pipefail -c "$c"; echo "::endgroup::"; done
+
+      - name: Register site (idempotent)
+        if: env.MODE == 'deploy'
+        run: |
+          set -euo pipefail
+          args=(lunova-site register --site "$SITE" --type "$TYPE" --domains "$DOMAINS" --repo "$GITHUB_REPOSITORY" --health-path "$HEALTH")
+          [ -n "$ROOT" ] && args+=(--root "$ROOT")
+          [ -n "$START" ] && args+=(--start "$START")
+          [ "$HTTP_ONLY" = "true" ] && args+=(--http-only)
+          if [ "$(yq -r 'has("hooks")' "$MANIFEST")" = "true" ]; then
+            if [ "$(yq -r '.hooks | length' "$MANIFEST")" = "0" ]; then
+              args+=(--hook true)   # hooks: [] means "run none"
+            else
+              while IFS= read -r h; do args+=(--hook "$h"); done < <(yq -r '.hooks[]' "$MANIFEST")
+            fi
+          fi
+          ssh lunova "$(printf '%q ' "${args[@]}")"
+
+      - name: Deliver environment
+        if: env.MODE == 'deploy'
+        env:
+          APP_ENV_FILE: ${{ secrets.LUNOVA_ENV }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_ENV_FILE:-}" ]; then
+            printf '%s\n' "$APP_ENV_FILE" | ssh lunova "lunova-site put-env $SITE"
+          else
+            echo "No LUNOVA_ENV secret set: keeping the existing shared/.env on the server."
+          fi
+
+      - name: Upload release
+        if: env.MODE == 'deploy'
+        run: |
+          set -euo pipefail
+          echo "RELEASE_ID=${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          ID="${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}"
+          ex=(--exclude .git --exclude .github --exclude '.env' --exclude '.env.*' --exclude '.lunova.yml')
+          [ "$KEEP_NODE_MODULES" = "true" ] || ex+=(--exclude node_modules)
+          while IFS= read -r e; do [ -n "$e" ] && ex+=(--exclude "$e"); done < <(yq -r '.exclude // [] | .[]' "$MANIFEST")
+          rsync -az --delete --mkpath "${ex[@]}" -e ssh ./ "lunova:/srv/sites/$SITE/releases/$ID/"
+
+      - name: Release (hooks, switch, health check, auto-rollback)
+        if: env.MODE == 'deploy'
+        run: |
+          set -euo pipefail
+          ssh lunova "lunova-site release $SITE $RELEASE_ID" | tee release.log
+          {
+            echo "### Lunova deploy: $SITE"
+            echo "- Release: \`$RELEASE_ID\`"
+            IFS=, read -ra D <<< "$DOMAINS"; for d in "${D[@]}"; do echo "- https://$d"; done
+          } >> "$GITHUB_STEP_SUMMARY"

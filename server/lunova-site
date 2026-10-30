@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""lunova-site: register, release, check and roll back sites on the Lunova server.
+
+Runs as the unprivileged `deploy` user. Only privileged action: sudo caddy-reload.
+Layout: /srv/sites/<site>/{releases/<id>,current,shared}, /etc/caddy/sites/<site>.caddy,
+        ~/.config/systemd/user/site-<site>.service, /srv/registry/sites/<site>.json
+All output is human readable; machine-readable results are printed as a final `RESULT {json}` line.
+"""
+import argparse, json, os, re, shutil, socket, subprocess, sys, time, urllib.request
+from pathlib import Path
+
+SITES = Path("/srv/sites"); REG = Path("/srv/registry"); CADDY = Path("/etc/caddy/sites")
+UNITS = Path.home() / ".config/systemd/user"
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
+HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+TYPES = ("static", "spa", "node", "python", "laravel")
+RESERVED = {"default", "caddy", "registry", "lunova", "admin", "root", "deploy", "ops"}
+KEEP = 5
+PORTS = range(3100, 4000)
+DEFAULT_HOOKS = {
+    "laravel": ["php artisan migrate --force", "php artisan config:cache", "php artisan route:cache",
+                "php artisan view:cache", "php artisan event:cache", "php artisan storage:link --force"],
+    "node": ["npm ci --omit=dev"],
+    "python": ["python3 -m venv .venv", ".venv/bin/pip install -q -r requirements.txt"],
+}
+
+
+def die(msg, code=1):
+    print(f"ERROR: {msg}", file=sys.stderr); sys.exit(code)
+
+
+def say(msg): print(msg, flush=True)
+
+
+def result(**kw): print("RESULT " + json.dumps(kw, sort_keys=True))
+
+
+def run(cmd, cwd=None, check=True, shell=False, env=None):
+    p = subprocess.run(cmd, cwd=cwd, shell=shell, text=True, capture_output=True, env=env)
+    if check and p.returncode != 0:
+        die(f"command failed ({p.returncode}): {cmd if shell else ' '.join(cmd)}\n{p.stdout}{p.stderr}")
+    return p
+
+
+def cfg():
+    p = REG / "config.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def check_name(n):
+    if not NAME_RE.match(n or "") or n in RESERVED:
+        die(f"invalid site name '{n}': use lowercase letters, digits, hyphens (2-41 chars), not reserved")
+
+
+def reg_path(site): return REG / "sites" / f"{site}.json"
+
+
+def load(site):
+    p = reg_path(site)
+    if not p.exists(): die(f"site '{site}' is not registered (run: lunova-site register ...)")
+    return json.loads(p.read_text())
+
+
+def save(site, data):
+    (REG / "sites").mkdir(parents=True, exist_ok=True)
+    tmp = reg_path(site).with_suffix(".tmp"); tmp.write_text(json.dumps(data, indent=2, sort_keys=True)); tmp.replace(reg_path(site))
+
+
+def all_sites():
+    d = REG / "sites"
+    return {p.stem: json.loads(p.read_text()) for p in sorted(d.glob("*.json"))} if d.exists() else {}
+
+
+def listening_ports():
+    out = run(["ss", "-ltnH"], check=False).stdout
+    return {int(m.group(1)) for m in re.finditer(r":(\d+)\s", out)}
+
+
+def caddy_reload(): run(["sudo", "-n", "/usr/local/sbin/caddy-reload"])
+
+
+def php_socket(): return cfg().get("php_socket", "/run/php/lunova.sock")
+
+
+def render_caddy(site, d):
+    hosts = ", ".join((f"http://{h}" if d.get("http_only") else h) for h in d["domains"])
+    cur = f"/srv/sites/{site}/current"
+    t = d["type"]
+    if t in ("static", "spa"):
+        body = f"\troot * {cur}/{d.get('root', '').strip('/')}".rstrip("/") + "\n\tencode zstd gzip\n"
+        if t == "spa": body += "\ttry_files {path} /index.html\n"
+        body += "\tfile_server\n"
+    elif t in ("node", "python"):
+        body = f"\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{d['port']}\n"
+    else:  # laravel
+        body = (f"\troot * {cur}/public\n\tencode zstd gzip\n\tphp_fastcgi unix/{php_socket()} {{\n"
+                f"\t\tresolve_root_symlink\n\t}}\n\tfile_server\n")
+    return f"# managed by lunova-site (site: {site}, repo: {d.get('repo', '-')})\n{hosts} {{\n{body}}}\n"
+
+
+def render_unit(site, d):
+    start = d["start"]
+    return (f"[Unit]\nDescription=Lunova site {site}\nAfter=network.target\n\n[Service]\n"
+            f"WorkingDirectory=/srv/sites/{site}/current\nEnvironmentFile=-/srv/sites/{site}/shared/.env\n"
+            f"Environment=PORT={d['port']} HOST=127.0.0.1\nExecStart=/usr/bin/bash -c 'exec {start}'\n"
+            f"Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n")
+
+
+def cmd_capabilities(a):
+    def ver(c, flag="--version"):
+        p = run([c, flag], check=False) if shutil.which(c) else None
+        return p.stdout.splitlines()[0].strip() if p and p.stdout else None
+    caps = {
+        "node": ver("node"), "npm": ver("npm"), "python3": ver("python3"), "php": ver("php"), "composer": ver("composer"),
+        "php_fpm_socket": php_socket() if os.path.exists(php_socket()) else None,
+        "mysql_client": bool(shutil.which("mysql")), "postgres_client": bool(shutil.which("psql")),
+        "disk_free_gb": round(shutil.disk_usage("/srv").free / 1e9, 1),
+        "sites": sorted(all_sites()), "public_ip": cfg().get("public_ip"),
+    }
+    for k, v in caps.items(): say(f"{k}: {v}")
+    result(ok=True, capabilities=caps)
+
+
+def cmd_check_domain(a):
+    ip = cfg().get("public_ip"); bad = []
+    for h in a.domains:
+        h = h.lower()
+        if not HOST_RE.match(h): bad.append((h, "invalid hostname")); continue
+        owner = next((s for s, d in all_sites().items() if h in d["domains"] and s != a.site), None)
+        if owner: bad.append((h, f"already used by site '{owner}'")); continue
+        try: res = socket.gethostbyname(h)
+        except OSError: bad.append((h, "does not resolve (create DNS A record)")); continue
+        if ip and res != ip: bad.append((h, f"points to {res}, expected {ip}"))
+        else: say(f"OK {h} -> {res}")
+    for h, why in bad: say(f"PROBLEM {h}: {why}")
+    result(ok=not bad, problems=[{"domain": h, "problem": w} for h, w in bad])
+    sys.exit(0 if not bad else 2)
+
+
+def cmd_register(a):
+    check_name(a.site)
+    if a.type not in TYPES: die(f"type must be one of {', '.join(TYPES)}")
+    domains = [h.lower() for h in a.domains.split(",") if h.strip()]
+    if not domains: die("at least one domain is required")
+    for h in domains:
+        if not HOST_RE.match(h): die(f"invalid domain '{h}'")
+    sites = all_sites(); old = sites.get(a.site)
+    if old and a.repo and old.get("repo") and old["repo"] != a.repo:
+        die(f"site '{a.site}' belongs to repo {old['repo']}, not {a.repo}")
+    for h in domains:
+        for s, d in sites.items():
+            if s != a.site and h in d["domains"]: die(f"domain {h} is already used by site '{s}'")
+    if a.type == "laravel" and not os.path.exists(php_socket()):
+        die(f"PHP-FPM socket {php_socket()} not found: ops must set up PHP-FPM first (see ops request: laravel)")
+    d = {"site": a.site, "type": a.type, "domains": domains, "repo": a.repo or (old or {}).get("repo"),
+         "root": a.root or "", "http_only": bool(a.http_only), "health_path": a.health_path,
+         "hooks": a.hook if a.hook is not None else DEFAULT_HOOKS.get(a.type, [])}
+    if a.type in ("node", "python"):
+        if not a.start and not (old and old.get("start")): die("--start is required for node/python sites")
+        start = a.start or old["start"]
+        if re.search(r"['\n%\r]", start): die("start command must not contain ', %, or newlines")
+        d["start"] = start
+        used = {x.get("port") for s, x in sites.items() if s != a.site}
+        d["port"] = (old or {}).get("port") or next((p for p in PORTS if p not in used and p not in listening_ports()), None)
+        if not d["port"]: die("no free port available")
+    base = SITES / a.site
+    for sub in ("releases", "shared"): (base / sub).mkdir(parents=True, exist_ok=True)
+    CADDY.mkdir(parents=True, exist_ok=True)
+    (CADDY / f"{a.site}.caddy").write_text(render_caddy(a.site, d))
+    if a.type in ("node", "python"):
+        UNITS.mkdir(parents=True, exist_ok=True)
+        (UNITS / f"site-{a.site}.service").write_text(render_unit(a.site, d))
+        run(["systemctl", "--user", "daemon-reload"])
+        run(["systemctl", "--user", "enable", f"site-{a.site}.service"], check=False)
+    save(a.site, d)
+    try: caddy_reload()
+    except SystemExit:
+        (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); raise
+    say(f"registered {a.site} ({a.type}) -> {', '.join(domains)}" + (f" on port {d['port']}" if d.get("port") else ""))
+    result(ok=True, site=a.site, type=a.type, domains=domains, port=d.get("port"), updated=bool(old))
+
+
+def releases(site):
+    d = SITES / site / "releases"
+    return sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime) if d.exists() else []
+
+
+def current_target(site):
+    cur = SITES / site / "current"
+    return os.path.realpath(cur) if cur.is_symlink() else None
+
+
+def switch(site, rel):
+    tmp = SITES / site / ".current.tmp"
+    tmp.unlink(missing_ok=True); tmp.symlink_to(rel); os.replace(tmp, SITES / site / "current")
+
+
+def restart(site, d):
+    if d["type"] in ("node", "python"):
+        run(["systemctl", "--user", "restart", f"site-{site}.service"])
+
+
+def health(site, d):
+    path = d.get("health_path") or "/"
+    if d["type"] in ("node", "python"): url, hdr = f"http://127.0.0.1:{d['port']}{path}", {}
+    else: url, hdr = f"http://127.0.0.1{path}", {"Host": d["domains"][0]}
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k): return None
+    op = urllib.request.build_opener(NoRedirect)
+    last = None
+    for _ in range(15):
+        try:
+            return op.open(urllib.request.Request(url, headers=hdr), timeout=5).status, url
+        except urllib.error.HTTPError as e:
+            last = e.code
+            if 200 <= e.code < 400: return e.code, url
+        except Exception as e: last = str(e)
+        time.sleep(1)
+    return last, url
+
+
+def cmd_release(a):
+    check_name(a.site); d = load(a.site)
+    if not ID_RE.match(a.id): die("invalid release id")
+    rel = SITES / a.site / "releases" / a.id
+    if not rel.is_dir(): die(f"release {rel} not found: upload it first")
+    env = SITES / a.site / "shared" / ".env"
+    if d["type"] == "laravel":
+        if not env.exists(): die("shared/.env is missing: set the LUNOVA_ENV secret in the repo and redeploy")
+        shared_storage = SITES / a.site / "shared" / "storage"
+        for sub in ("app/public", "framework/cache/data", "framework/sessions", "framework/views", "logs"):
+            (shared_storage / sub).mkdir(parents=True, exist_ok=True)
+        if (rel / "storage").exists() and not (rel / "storage").is_symlink(): shutil.rmtree(rel / "storage")
+        (rel / "storage").unlink(missing_ok=True); (rel / "storage").symlink_to(shared_storage)
+        (rel / "bootstrap/cache").mkdir(parents=True, exist_ok=True)
+    if env.exists():
+        (rel / ".env").unlink(missing_ok=True); (rel / ".env").symlink_to(env)
+    prev = current_target(a.site)
+    for h in d.get("hooks", []):
+        say(f"hook: {h}")
+        p = run(["bash", "-c", h], cwd=rel, check=False)
+        if p.returncode != 0:
+            say(p.stdout + p.stderr); die(f"hook failed: {h} (nothing was switched; the live site is unchanged)")
+    switch(a.site, rel)
+    restart(a.site, d)
+    code, url = health(a.site, d)
+    if not (isinstance(code, int) and 200 <= code < 400):
+        say(f"health check failed ({code}) at {url}")
+        if prev: switch(a.site, prev); restart(a.site, d); say(f"rolled back to {os.path.basename(prev)}")
+        result(ok=False, site=a.site, release=a.id, health=str(code), rolled_back=bool(prev)); sys.exit(3)
+    os.utime(rel)
+    for old in releases(a.site)[:-KEEP]:
+        if str(old) != current_target(a.site): shutil.rmtree(old, ignore_errors=True)
+    say(f"released {a.site} {a.id} (health {code})")
+    result(ok=True, site=a.site, release=a.id, health=code, domains=d["domains"])
+
+
+def cmd_rollback(a):
+    check_name(a.site); d = load(a.site)
+    cur = current_target(a.site); rels = [r for r in releases(a.site) if str(r) != cur]
+    target = (SITES / a.site / "releases" / a.to) if a.to else (rels[-1] if rels else None)
+    if not target or not target.is_dir(): die("no previous release to roll back to")
+    switch(a.site, target); restart(a.site, d)
+    code, _ = health(a.site, d)
+    say(f"rolled back {a.site} to {target.name} (health {code})")
+    result(ok=isinstance(code, int) and 200 <= code < 400, site=a.site, release=target.name, health=str(code))
+
+
+def cmd_status(a):
+    check_name(a.site); d = load(a.site); cur = current_target(a.site)
+    active = None
+    if d["type"] in ("node", "python"):
+        active = run(["systemctl", "--user", "is-active", f"site-{a.site}.service"], check=False).stdout.strip()
+    code, url = health(a.site, d) if cur else (None, None)
+    say(json.dumps({**d, "current": os.path.basename(cur) if cur else None, "service": active, "health": code}, indent=2))
+    result(ok=True, site=a.site, current=os.path.basename(cur) if cur else None, service=active, health=str(code), releases=[r.name for r in releases(a.site)])
+
+
+def cmd_put_env(a):
+    """Write stdin to shared/.env atomically (mode 0600). Used by CI to deliver the app's environment."""
+    check_name(a.site); load(a.site)
+    data = sys.stdin.read()
+    if not data.strip(): die("empty environment on stdin; refusing to overwrite shared/.env")
+    shared = SITES / a.site / "shared"; shared.mkdir(parents=True, exist_ok=True)
+    tmp = shared / ".env.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(data if data.endswith("\n") else data + "\n")
+    tmp.replace(shared / ".env")
+    say(f"wrote shared/.env for {a.site} ({len(data.splitlines())} lines)"); result(ok=True, site=a.site)
+
+
+def cmd_list(a):
+    for s, d in all_sites().items(): say(f"{s}\t{d['type']}\t{','.join(d['domains'])}\t{d.get('repo', '-')}")
+    result(ok=True, sites=sorted(all_sites()))
+
+
+def cmd_unregister(a):
+    check_name(a.site); d = load(a.site)
+    if not a.yes: die("refusing without --yes (this removes the site's Caddy config and service; data in /srv/sites is kept)")
+    if d["type"] in ("node", "python"):
+        run(["systemctl", "--user", "disable", "--now", f"site-{a.site}.service"], check=False)
+        (UNITS / f"site-{a.site}.service").unlink(missing_ok=True); run(["systemctl", "--user", "daemon-reload"])
+    (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); reg_path(a.site).unlink(); caddy_reload()
+    say(f"unregistered {a.site}"); result(ok=True, site=a.site)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="lunova-site"); sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("capabilities").set_defaults(f=cmd_capabilities)
+    c = sp.add_parser("check-domain"); c.add_argument("--site", default=""); c.add_argument("domains", nargs="+"); c.set_defaults(f=cmd_check_domain)
+    r = sp.add_parser("register"); r.add_argument("--site", required=True); r.add_argument("--type", required=True)
+    r.add_argument("--domains", required=True); r.add_argument("--repo"); r.add_argument("--start"); r.add_argument("--root")
+    r.add_argument("--health-path", default="/"); r.add_argument("--hook", action="append"); r.add_argument("--http-only", action="store_true")
+    r.set_defaults(f=cmd_register)
+    x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)
+    b = sp.add_parser("rollback"); b.add_argument("site"); b.add_argument("--to"); b.set_defaults(f=cmd_rollback)
+    s = sp.add_parser("status"); s.add_argument("site"); s.set_defaults(f=cmd_status)
+    sp.add_parser("list").set_defaults(f=cmd_list)
+    e = sp.add_parser("put-env"); e.add_argument("site"); e.set_defaults(f=cmd_put_env)
+    u = sp.add_parser("unregister"); u.add_argument("site"); u.add_argument("--yes", action="store_true"); u.set_defaults(f=cmd_unregister)
+    a = p.parse_args(); a.f(a)
+
+
+if __name__ == "__main__":
+    main()
