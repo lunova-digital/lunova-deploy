@@ -1,0 +1,6 @@
+#!/bin/sh
+# sshd AuthorizedKeysCommand (args: %u %t %k). Any throwaway ed25519 key may reach the `deploy` user, but ONLY into lunova-gate,
+# which authenticates the caller by its GitHub OIDC token. No SSH key is stored in GitHub or in the workflow repo.
+[ "$1" = "deploy" ] && [ "$2" = "ssh-ed25519" ] || exit 0
+printf '%s' "$3" | grep -Eq '^[A-Za-z0-9+/=]{20,200}$' || exit 0
+printf 'restrict,command="/usr/local/bin/lunova-gate" ssh-ed25519 %s\n' "$3"

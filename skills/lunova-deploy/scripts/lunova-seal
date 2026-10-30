@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""lunova-seal: encrypt env values for the Lunova server so they can be committed safely.
+
+  echo '{"set": {"RESEND_KEY": "re_123"}, "unset": ["OLD_KEY"]}' | lunova-seal --site my-site --repo owner/repo [--out .lunova/env.sealed]
+
+Values come from stdin (never argv/shell history) and are encrypted with the server's public key (seal.pub.pem next to
+the skill). Only the server can decrypt; the sealed file is safe to commit. Applying it merges the keys into the site's
+environment on the server and leaves every other key alone. Needs python3 and openssl only.
+"""
+import argparse, base64, json, os, secrets, subprocess, sys, time
+from pathlib import Path
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--site", required=True); ap.add_argument("--repo", required=True)
+ap.add_argument("--out", default=".lunova/env.sealed")
+ap.add_argument("--pub", default=str(Path(__file__).resolve().parent.parent / "seal.pub.pem"))
+a = ap.parse_args()
+req = json.load(sys.stdin)
+sets, unsets = req.get("set", {}), req.get("unset", [])
+if not sets and not unsets: sys.exit("nothing to seal")
+payload = json.dumps({"v": 1, "site": a.site, "repo": a.repo, "ts": int(time.time()), "set": sets, "unset": unsets}, sort_keys=True)
+
+key = secrets.token_hex(32)
+wrapped = subprocess.run(["openssl", "pkeyutl", "-encrypt", "-pubin", "-inkey", a.pub, "-pkeyopt", "rsa_padding_mode:oaep",
+                          "-pkeyopt", "rsa_oaep_md:sha256"], input=key.encode(), capture_output=True, check=True).stdout
+r, w = os.pipe(); os.write(w, key.encode() + b"\n"); os.close(w)
+try:
+    body = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-a", "-A", "-pass", f"fd:{r}"], input=payload.encode(),
+                          capture_output=True, check=True, pass_fds=(r,)).stdout.decode()
+finally: os.close(r)
+out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("LUNOVA-SEALED-1\n" + base64.b64encode(wrapped).decode() + "\n" + body + "\n")
+print(f"sealed {len(sets)} set / {len(unsets)} unset -> {out} (names: {', '.join(sorted(sets)) or '-'})")

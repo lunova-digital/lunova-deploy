@@ -6,8 +6,12 @@ Layout: /srv/sites/<site>/{releases/<id>,current,shared}, /etc/caddy/sites/<site
         ~/.config/systemd/user/site-<site>.service, /srv/registry/sites/<site>.json
 All output is human readable; machine-readable results are printed as a final `RESULT {json}` line.
 """
-import argparse, ipaddress, json, os, re, shutil, socket, subprocess, sys, time, urllib.request
+import argparse, hashlib, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, time, urllib.request
 from pathlib import Path
+
+# Verified caller identity, exported by lunova-gate from the GitHub OIDC token. Unset when ops run this directly.
+WHO = os.environ.get("LUNOVA_REPO") or None
+REF = os.environ.get("LUNOVA_REF") or ""
 
 SITES = Path("/srv/sites"); REG = Path("/srv/registry"); CADDY = Path("/etc/caddy/sites")
 UNITS = Path.home() / ".config/systemd/user"
@@ -61,10 +65,16 @@ def check_name(n):
 def reg_path(site): return REG / "sites" / f"{site}.json"
 
 
-def load(site):
+def load(site, write=False):
+    """Load a site. Through the gate, only the repo the site is bound to may touch it; changes only from its deploy branch."""
     p = reg_path(site)
     if not p.exists(): die(f"site '{site}' is not registered (run: lunova-site register ...)")
-    return json.loads(p.read_text())
+    d = json.loads(p.read_text())
+    if WHO:
+        if d.get("repo") != WHO: die(f"site '{site}' belongs to another repository")
+        if write and d.get("branch") and REF != f"refs/heads/{d['branch']}":
+            die(f"site '{site}' deploys from branch '{d['branch']}' only (this run is {REF or 'unknown'})")
+    return d
 
 
 def save(site, data):
@@ -144,27 +154,106 @@ def sync_workers(site, d):
     run(["systemctl", "--user", "daemon-reload"])
 
 
-def ensure_db(site):
-    """Ask the root helper for DB credentials; keep them in shared/db.env (0600)."""
-    p = run(["sudo", "-n", "/usr/local/sbin/lunova-db", "ensure", site])
+def provision(pkgs):
+    """Install packages this project needs (root helper validates names; nothing outside deployment tooling)."""
+    pkgs = sorted(set(pkgs))
+    if not pkgs: return
+    say(f"provisioning packages: {' '.join(pkgs)}")
+    p = run(["sudo", "-n", "/usr/local/sbin/lunova-provision", "install", *pkgs], check=False)
+    if p.returncode != 0: die(f"could not install {' '.join(pkgs)}:\n{p.stdout}{p.stderr}")
+    say(p.stdout.strip())
+
+
+DB_PHP_EXT = {"mysql": "php8.3-mysql", "postgres": "php8.3-pgsql", "sqlite": "php8.3-sqlite3"}
+# composer "ext-*" -> Ubuntu package. Core/always-present extensions are not listed.
+EXT_PKG = {"mbstring": "php8.3-mbstring", "xml": "php8.3-xml", "dom": "php8.3-xml", "simplexml": "php8.3-xml", "xmlreader": "php8.3-xml",
+           "xmlwriter": "php8.3-xml", "curl": "php8.3-curl", "zip": "php8.3-zip", "gd": "php8.3-gd", "intl": "php8.3-intl",
+           "bcmath": "php8.3-bcmath", "pdo_mysql": "php8.3-mysql", "mysqli": "php8.3-mysql", "mysqlnd": "php8.3-mysql",
+           "pdo_pgsql": "php8.3-pgsql", "pgsql": "php8.3-pgsql", "pdo_sqlite": "php8.3-sqlite3", "sqlite3": "php8.3-sqlite3",
+           "redis": "php8.3-redis", "imagick": "php8.3-imagick", "gmp": "php8.3-gmp", "soap": "php8.3-soap", "exif": "php8.3-common",
+           "opcache": "php8.3-opcache", "ldap": "php8.3-ldap", "imap": "php8.3-imap", "memcached": "php8.3-memcached", "apcu": "php8.3-apcu"}
+
+
+def ensure_runtime(site, d, rel):
+    """Before hooks run: make sure the server can actually run this release (extensions, DB engine, declared packages)."""
+    pkgs = list(d.get("packages", []))
+    if d["type"] == "laravel":
+        if d.get("database") in DB_PHP_EXT: pkgs.append(DB_PHP_EXT[d["database"]])
+        if (rel / "composer.lock").exists() and shutil.which("composer"):
+            p = run(["composer", "check-platform-reqs", "--no-dev", "--format=json", "--no-interaction"], cwd=rel, check=False)
+            try: rows = json.loads(p.stdout or "[]")
+            except ValueError: rows = []
+            for r in rows:
+                if r.get("status") != "missing" or not str(r.get("name", "")).startswith("ext-"): continue
+                ext = r["name"][4:]
+                if ext in EXT_PKG: pkgs.append(EXT_PKG[ext])
+                else: die(f"the project needs PHP extension '{ext}' which Lunova does not know how to install. Add the apt package to `packages:` in .lunova.yml.")
+    if d.get("database") == "postgres": pkgs += ["postgresql", "postgresql-client"]
+    provision(pkgs)
+
+
+def ensure_db(site, engine):
+    """DB credentials are generated server-side and kept in shared/db.env (0600). Developers never see or choose them."""
     shared = SITES / site / "shared"; shared.mkdir(parents=True, exist_ok=True)
+    if engine == "sqlite":
+        f = shared / "database.sqlite"; f.touch(mode=0o600)
+        out = f"DB_CONNECTION=sqlite\nDB_DATABASE={f}\n"
+    else:
+        if engine == "postgres": provision(["postgresql", "postgresql-client"])
+        out = run(["sudo", "-n", "/usr/local/sbin/lunova-db", "ensure", site]).stdout
     tmp = shared / "db.env.tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f: f.write(p.stdout)
+    with os.fdopen(fd, "w") as f: f.write(out)
     tmp.replace(shared / "db.env")
 
 
+def parse_env(text):
+    """Ordered {KEY: raw value} of an env file (comments and blank lines are dropped)."""
+    out = {}
+    for l in text.splitlines():
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", l)
+        if m: out[m.group(1)] = m.group(2)
+    return out
+
+
+def dump_env(kv): return "".join(f"{k}={v}\n" for k, v in kv.items())
+
+
+def env_quote(v):
+    return v if re.fullmatch(r"[A-Za-z0-9_./:@%+,=-]*", v) else '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("\n", "\\n") + '"'
+
+
+def write_secret(path, text):
+    tmp = path.with_name(path.name + ".tmp"); fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(text)
+    tmp.replace(path)
+
+
+def seed_env(site, d, rel):
+    """First/every release: add what the app needs but nobody has set yet. Existing values are never overwritten.
+    Order of precedence: values the developer sealed > server defaults > the repo's .env.example."""
+    shared = SITES / site / "shared"; base = shared / ".env.base"
+    kv = parse_env(base.read_text()) if base.exists() else {}
+    if d["type"] == "laravel":
+        scheme = "http" if d.get("http_only") else "https"
+        defaults = {"APP_ENV": "production", "APP_DEBUG": "false", "APP_URL": f"{scheme}://{d['domains'][0]}"}
+        for k, v in defaults.items(): kv.setdefault(k, v)
+    ex = rel / ".env.example"
+    if ex.exists():
+        for k, v in parse_env(ex.read_text()).items(): kv.setdefault(k, v)
+    if d["type"] == "laravel" and not kv.get("APP_KEY"):
+        kv["APP_KEY"] = "base64:" + __import__("base64").b64encode(secrets.token_bytes(32)).decode()
+    if kv: write_secret(base, dump_env(kv))
+
+
 def build_env(site):
-    """shared/.env = shared/.env.base (from the LUNOVA_ENV secret) with DB_* overridden by shared/db.env."""
+    """shared/.env = shared/.env.base (defaults + sealed values) with DB_* overridden by shared/db.env."""
     shared = SITES / site / "shared"; base, dbf = shared / ".env.base", shared / "db.env"
-    if not base.exists():
-        if (shared / ".env").exists() and not (shared / ".env").is_symlink(): shutil.copy(shared / ".env", base)
-        elif not dbf.exists(): return False
-    lines = base.read_text().splitlines() if base.exists() else []
+    if not base.exists() and not dbf.exists(): return False
+    kv = parse_env(base.read_text()) if base.exists() else {}
     if dbf.exists():
-        lines = [l for l in lines if l.split("=", 1)[0].strip() not in DB_KEYS] + [""] + dbf.read_text().splitlines()
-    tmp = shared / ".env.tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f: f.write("\n".join(lines).strip("\n") + "\n")
-    tmp.replace(shared / ".env"); return True
+        for k in DB_KEYS: kv.pop(k, None)
+        kv.update(parse_env(dbf.read_text()))
+    write_secret(shared / ".env", dump_env(kv)); return True
 
 
 def cmd_capabilities(a):
@@ -176,7 +265,7 @@ def cmd_capabilities(a):
         "php_fpm_socket": php_socket() if os.path.exists(php_socket()) else None,
         "mysql_client": bool(shutil.which("mysql")), "postgres_client": bool(shutil.which("psql")),
         "disk_free_gb": round(shutil.disk_usage("/srv").free / 1e9, 1),
-        "sites": sorted(all_sites()), "public_ip": cfg().get("public_ip"),
+        "sites": sorted(s for s, d in all_sites().items() if not WHO or d.get("repo") == WHO), "public_ip": cfg().get("public_ip"),
     }
     for k, v in caps.items(): say(f"{k}: {v}")
     result(ok=True, capabilities=caps)
@@ -210,8 +299,18 @@ def cmd_register(a):
     for h in domains:
         if not HOST_RE.match(h): die(f"invalid domain '{h}'")
     sites = all_sites(); old = sites.get(a.site)
+    if WHO:  # through the gate: identity comes from the OIDC token, never from arguments
+        a.repo = WHO
+        if not REF.startswith("refs/heads/"): die("sites can only be registered from a branch push (not a PR or tag)")
+    branch = REF.removeprefix("refs/heads/") if WHO else (old or {}).get("branch")
     if old and a.repo and old.get("repo") and old["repo"] != a.repo:
         die(f"site '{a.site}' belongs to repo {old['repo']}, not {a.repo}")
+    if old and WHO and old.get("branch") and old["branch"] != branch:
+        die(f"site '{a.site}' deploys from branch '{old['branch']}' only. To move it to '{branch}', ask Lunova ops.")
+    pkgs = []
+    for x in a.package or []:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.+-]{1,60}", x): die(f"invalid package name '{x}'")
+        pkgs.append(x)
     for h in domains:
         for s, d in sites.items():
             if s != a.site and h in d["domains"]: die(f"domain {h} is already used by site '{s}'")
@@ -220,7 +319,8 @@ def cmd_register(a):
     d = {"site": a.site, "type": a.type, "domains": domains, "repo": a.repo or (old or {}).get("repo"),
          "root": a.root or "", "http_only": bool(a.http_only), "health_path": a.health_path,
          "hooks": a.hook if a.hook is not None else DEFAULT_HOOKS.get(a.type, []),
-         "database": a.database, "queue": bool(a.queue), "scheduler": bool(a.scheduler)}
+         "database": a.database, "queue": bool(a.queue), "scheduler": bool(a.scheduler), "packages": sorted(set(pkgs)),
+         "branch": branch}
     if (a.queue or a.scheduler) and a.type != "laravel": die("--queue/--scheduler are only supported for laravel sites")
     if a.type in ("node", "python"):
         if not a.start and not (old and old.get("start")): die("--start is required for node/python sites")
@@ -240,7 +340,7 @@ def cmd_register(a):
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", f"site-{a.site}.service"], check=False)
     save(a.site, d)
-    if d["database"]: ensure_db(a.site); build_env(a.site)
+    if d["database"]: ensure_db(a.site, d["database"]); build_env(a.site)
     sync_workers(a.site, d)
     try: caddy_reload()
     except SystemExit:
@@ -301,14 +401,15 @@ def health(site, d):
 
 
 def cmd_release(a):
-    check_name(a.site); d = load(a.site)
+    check_name(a.site); d = load(a.site, write=True)
     if not ID_RE.match(a.id): die("invalid release id")
     rel = SITES / a.site / "releases" / a.id
     if not rel.is_dir(): die(f"release {rel} not found: upload it first")
     env = SITES / a.site / "shared" / ".env"
+    ensure_runtime(a.site, d, rel)
+    seed_env(a.site, d, rel)
     build_env(a.site)
     if d["type"] == "laravel":
-        if not env.exists(): die("shared/.env is missing: set the LUNOVA_ENV secret in the repo and redeploy")
         shared_storage = SITES / a.site / "shared" / "storage"
         for sub in ("app/public", "framework/cache/data", "framework/sessions", "framework/views", "logs"):
             (shared_storage / sub).mkdir(parents=True, exist_ok=True)
@@ -340,7 +441,7 @@ def cmd_release(a):
 
 
 def cmd_rollback(a):
-    check_name(a.site); d = load(a.site)
+    check_name(a.site); d = load(a.site, write=True)
     cur = current_target(a.site)
     if a.to:
         target = SITES / a.site / "releases" / a.to
@@ -367,21 +468,66 @@ def cmd_status(a):
         for unit in ("queue.service", "schedule.timer"):
             if (UNITS / f"site-{a.site}-{unit}").exists():
                 extra[unit.split(".")[0]] = run(["systemctl", "--user", "is-active", f"site-{a.site}-{unit}"], check=False).stdout.strip()
+    envf = SITES / a.site / "shared" / ".env.base"
+    names = {k: ("set" if v.strip().strip("\"'") else "empty") for k, v in parse_env(envf.read_text()).items()} if envf.exists() else {}
     say(json.dumps({**d, "current": os.path.basename(cur) if cur else None, "service": active, "health": code, **extra}, indent=2))
+    if names:
+        say("env (names only; DB_* are managed by the server):")
+        for k, v in sorted(names.items()): say(f"  {k:28s} {v}")
     result(ok=True, site=a.site, current=os.path.basename(cur) if cur else None, service=active, health=str(code), releases=[r.name for r in releases(a.site)])
 
 
-def cmd_put_env(a):
-    """Write stdin to shared/.env atomically (mode 0600). Used by CI to deliver the app's environment."""
-    check_name(a.site); load(a.site)
-    data = sys.stdin.read()
-    if not data.strip(): die("empty environment on stdin; refusing to overwrite shared/.env")
-    shared = SITES / a.site / "shared"; shared.mkdir(parents=True, exist_ok=True)
-    tmp = shared / ".env.base.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f: f.write(data if data.endswith("\n") else data + "\n")
-    tmp.replace(shared / ".env.base"); build_env(a.site)
-    say(f"wrote shared/.env for {a.site} ({len(data.splitlines())} lines; DB_* come from the server)"); result(ok=True, site=a.site)
+SEAL_KEY = Path("/var/lib/lunova/seal/private.pem")
+
+
+def unseal(blob):
+    """Sealed file format (3 lines): LUNOVA-SEALED-1 / base64(RSA-OAEP-SHA256(random key)) / base64(openssl enc aes-256-cbc pbkdf2)."""
+    import base64
+    lines = blob.strip().splitlines()
+    if len(lines) != 3 or lines[0] != "LUNOVA-SEALED-1": die("not a Lunova sealed env file")
+    try: wrapped = base64.b64decode(lines[1], validate=True)
+    except ValueError: die("sealed env file is corrupt")
+    k = run_bytes(["openssl", "pkeyutl", "-decrypt", "-inkey", str(SEAL_KEY), "-pkeyopt", "rsa_padding_mode:oaep",
+                   "-pkeyopt", "rsa_oaep_md:sha256"], wrapped)
+    if k is None: die("sealed env cannot be decrypted (sealed for another server?)")
+    r, w = os.pipe(); os.write(w, k.strip() + b"\n"); os.close(w)
+    try:
+        p = subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-a", "-A", "-pass", f"fd:{r}"], input=lines[2].encode(),
+                           capture_output=True, pass_fds=(r,))
+    finally: os.close(r)
+    if p.returncode != 0: die("sealed env cannot be decrypted (corrupt or tampered)")
+    try: return json.loads(p.stdout)
+    except ValueError: die("sealed env payload is not valid")
+
+
+def run_bytes(cmd, data):
+    p = subprocess.run(cmd, input=data, capture_output=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def cmd_apply_env(a):
+    """Merge the developer's sealed env patch (stdin) into the site's environment. Idempotent: the same file is applied once."""
+    check_name(a.site); d = load(a.site, write=True)
+    blob = sys.stdin.read(70000)
+    if not blob.strip(): die("empty sealed env on stdin")
+    digest = hashlib.sha256(blob.encode()).hexdigest()
+    if d.get("env_hash") == digest: say("sealed env unchanged since the last deploy; nothing to apply"); result(ok=True, applied=False); return
+    pl = unseal(blob)
+    if pl.get("v") != 1 or pl.get("site") != a.site: die("sealed env was made for a different site")
+    if WHO and pl.get("repo") != WHO: die("sealed env was made for a different repository")
+    sets, unsets = pl.get("set", {}), pl.get("unset", [])
+    if not isinstance(sets, dict) or not isinstance(unsets, list): die("sealed env payload is not valid")
+    for k, v in sets.items():
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", k) or not isinstance(v, str): die(f"invalid env variable '{k}'")
+        if k in DB_KEYS: die(f"{k} is managed by the server (database credentials are generated and injected automatically)")
+    shared = SITES / a.site / "shared"; shared.mkdir(parents=True, exist_ok=True); base = shared / ".env.base"
+    kv = parse_env(base.read_text()) if base.exists() else {}
+    for k, v in sets.items(): kv[k] = env_quote(v)
+    for k in unsets: kv.pop(k, None)
+    write_secret(base, dump_env(kv)); build_env(a.site)
+    d["env_hash"] = digest; save(a.site, d)
+    say(f"applied sealed env to {a.site}: set {len(sets)}, unset {len(unsets)} ({', '.join(sorted(sets)) or '-'})")
+    result(ok=True, applied=True, set=sorted(sets), unset=sorted(unsets))
 
 
 def cmd_logs(a):
@@ -398,12 +544,13 @@ def cmd_logs(a):
 
 
 def cmd_list(a):
-    for s, d in all_sites().items(): say(f"{s}\t{d['type']}\t{','.join(d['domains'])}\t{d.get('repo', '-')}")
-    result(ok=True, sites=sorted(all_sites()))
+    mine = {s: d for s, d in all_sites().items() if not WHO or d.get("repo") == WHO}
+    for s, d in mine.items(): say(f"{s}\t{d['type']}\t{','.join(d['domains'])}\t{d.get('repo', '-')}")
+    result(ok=True, sites=sorted(mine))
 
 
 def cmd_unregister(a):
-    check_name(a.site); d = load(a.site)
+    check_name(a.site); d = load(a.site, write=True)
     if not a.yes: die("refusing without --yes (this removes the site's Caddy config and service; data in /srv/sites is kept)")
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "disable", "--now", f"site-{a.site}.service"], check=False)
@@ -419,7 +566,8 @@ def main():
     c = sp.add_parser("check-domain"); c.add_argument("--site", default=""); c.add_argument("domains", nargs="+"); c.set_defaults(f=cmd_check_domain)
     r = sp.add_parser("register"); r.add_argument("--site", required=True); r.add_argument("--type", required=True)
     r.add_argument("--domains", required=True); r.add_argument("--repo"); r.add_argument("--start"); r.add_argument("--root")
-    r.add_argument("--database", choices=["mysql"]); r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
+    r.add_argument("--database", choices=["mysql", "postgres", "sqlite"]); r.add_argument("--package", action="append")
+    r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
     r.add_argument("--health-path", default="/"); r.add_argument("--hook", action="append"); r.add_argument("--http-only", action="store_true")
     r.set_defaults(f=cmd_register)
     x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)
@@ -427,7 +575,7 @@ def main():
     s = sp.add_parser("status"); s.add_argument("site"); s.set_defaults(f=cmd_status)
     sp.add_parser("list").set_defaults(f=cmd_list)
     lg = sp.add_parser("logs"); lg.add_argument("site"); lg.add_argument("--lines", type=int, default=80); lg.set_defaults(f=cmd_logs)
-    e = sp.add_parser("put-env"); e.add_argument("site"); e.set_defaults(f=cmd_put_env)
+    e = sp.add_parser("apply-env"); e.add_argument("site"); e.set_defaults(f=cmd_apply_env)
     u = sp.add_parser("unregister"); u.add_argument("site"); u.add_argument("--yes", action="store_true"); u.set_defaults(f=cmd_unregister)
     a = p.parse_args(); a.f(a)
 

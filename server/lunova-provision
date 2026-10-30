@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""lunova-provision: install packages a site needs in order to deploy. Root-owned.
+
+`deploy` may run ONLY `sudo lunova-provision install <pkg>...`, and in practice only lunova-site calls it, with names
+derived from the project itself (PHP extensions from composer's platform check, the database engine, packages the
+repo's .lunova.yml declares). There is no fixed allow-list, but anything that is not deployment tooling is refused:
+system/security/boot/container packages, version pins, removals, options.
+"""
+import fcntl, os, re, shutil, subprocess, sys, time
+from pathlib import Path
+
+NAME = re.compile(r"^[a-z0-9][a-z0-9.+-]{1,60}$")
+DENY = re.compile(r"^(openssh|ssh|sudo|su$|login$|passwd$|libpam|apparmor|ufw$|iptables|nftables|fail2ban|systemd|udev|dbus|grub|"
+                  r"linux-|snapd|docker|containerd|runc|podman|lxc|lxd|kubernetes|kubectl|apt$|apt-|dpkg|libc6|libc-bin|bash$|dash$|"
+                  r"coreutils|util-linux|cron|anacron|at$|netplan|network-manager|cloud-init|unattended|"
+                  r"caddy|nginx|apache2|mariadb-server|mysql-server|openvpn|wireguard|tor$|nmap|netcat|socat|hydra|john$|aircrack)")
+LOG = Path("/var/log/lunova-provision.log")
+STAMP = Path("/var/lib/lunova/apt-updated")
+
+
+def die(m, code=1): print(f"ERROR: {m}", file=sys.stderr); sys.exit(code)
+
+
+if len(sys.argv) < 3 or sys.argv[1] != "install": die("usage: lunova-provision install <package>...")
+pkgs = sys.argv[2:]
+if len(pkgs) > 20: die("too many packages in one call")
+for p in pkgs:
+    if not NAME.match(p) or p.startswith("-"): die(f"invalid package name '{p}'")
+    if DENY.match(p): die(f"package '{p}' is not deployment tooling and will not be installed here")
+
+lock = open("/var/lock/lunova-provision.lock", "w"); fcntl.flock(lock, fcntl.LOCK_EX)
+env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "a"}
+
+
+def apt(*args, timeout=900):
+    return subprocess.run(["apt-get", "-o", "Dpkg::Options::=--force-confold", "-o", "DPkg::Lock::Timeout=120", *args],
+                          env=env, text=True, capture_output=True, timeout=timeout)
+
+
+missing = [p for p in pkgs if subprocess.run(["dpkg", "-s", p], capture_output=True).returncode != 0]
+if not missing:
+    print("already installed: " + " ".join(pkgs)); sys.exit(0)
+if not STAMP.exists() or time.time() - STAMP.stat().st_mtime > 86400:
+    r = apt("update", "-qq")
+    if r.returncode == 0: STAMP.parent.mkdir(parents=True, exist_ok=True); STAMP.touch()
+for p in missing:
+    pol = subprocess.run(["apt-cache", "policy", p], text=True, capture_output=True).stdout
+    if "Candidate:" not in pol or "Candidate: (none)" in pol: die(f"package '{p}' does not exist in the Ubuntu repositories")
+r = apt("install", "-y", "--no-install-recommends", *missing)
+with open(LOG, "a") as f:
+    f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} uid={os.environ.get('SUDO_UID', '?')} install {' '.join(missing)} rc={r.returncode}\n")
+if r.returncode != 0:
+    die(f"apt-get failed for {' '.join(missing)}:\n{(r.stdout + r.stderr)[-1500:]}")
+if any(p.startswith("php") for p in missing):
+    for svc in [s for s in ("php8.3-fpm",) if shutil.which("systemctl")]:
+        subprocess.run(["systemctl", "reload", svc], capture_output=True)
+print("installed: " + " ".join(missing))

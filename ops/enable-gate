@@ -1,0 +1,16 @@
+#!/bin/bash
+# ops-only, one time. Lets GitHub runners reach the Lunova server WITHOUT any stored SSH key.
+#
+# What it changes: sshd gets an AuthorizedKeysCommand for the `deploy` user. For `deploy` it accepts any ed25519 key a runner
+# generates for itself, but every such login is forced into /usr/local/bin/lunova-gate (no shell, no PTY, no forwarding),
+# which only proceeds after verifying a GitHub Actions OIDC token: signed by GitHub, audience "lunova", owner in
+# /srv/registry/config.json allowed_owners (name + numeric id), called from the shared workflow. Ops keep the `ops` key.
+# Validates with `sshd -t`, reloads (not restarts), and reverts by itself if the config does not validate.
+# Undo: sudo rm /etc/ssh/sshd_config.d/99-lunova.conf && sudo systemctl reload ssh
+set -euo pipefail
+HOST="${1:-lunova}"
+ssh "$HOST" 'set -e
+f=/etc/ssh/sshd_config.d/99-lunova.conf
+printf "# Lunova: GitHub Actions deploys authenticate with an OIDC token inside lunova-gate, not with a stored SSH key.\nMatch User deploy\n    AuthorizedKeysCommand /usr/local/bin/lunova-authkeys %%u %%t %%k\n    AuthorizedKeysCommandUser nobody\n" | sudo tee $f >/dev/null
+if sudo sshd -t; then sudo systemctl reload ssh && echo "enabled: deploy accepts runner keys, forced into lunova-gate"; else sudo rm -f $f; echo "sshd config invalid, reverted" >&2; exit 1; fi'
+ssh -o BatchMode=yes "$HOST" 'echo "ops login still works"'

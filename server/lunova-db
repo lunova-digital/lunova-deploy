@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""lunova-db: create (idempotently) a MariaDB database + user for a registered site.
+"""lunova-db: create (idempotently) a database + user for a registered site. MariaDB (mysql) or PostgreSQL (postgres).
 
 Root-owned; `deploy` may run ONLY `sudo lunova-db ensure <site>`. Prints DB_* lines on stdout.
-Passwords are kept root-side in /var/lib/lunova/db/<site>.pw and never written into deploy-owned paths.
+The password is generated here, kept root-side in /var/lib/lunova/db/<site>.pw and never chosen by a developer.
 """
-import hashlib, json, os, re, secrets, subprocess, sys
+import hashlib, json, os, re, secrets, shutil, subprocess, sys
 from pathlib import Path
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
@@ -18,7 +18,8 @@ if len(sys.argv) != 3 or sys.argv[1] != "ensure": die("usage: lunova-db ensure <
 site = sys.argv[2]
 if not NAME_RE.match(site): die("invalid site name")
 if not (REG / f"{site}.json").is_file(): die("site is not registered")
-if json.loads((REG / f"{site}.json").read_text()).get("database") != "mysql": die("site did not request a database")
+engine = json.loads((REG / f"{site}.json").read_text()).get("database")
+if engine not in ("mysql", "postgres"): die("site did not request a database that needs provisioning")
 
 db = "app_" + site.replace("-", "_")
 user = db if len(db) <= 32 else db[:23] + "_" + hashlib.sha1(site.encode()).hexdigest()[:8]
@@ -29,13 +30,28 @@ else:
     pw = secrets.token_hex(20)
     fd = os.open(pwf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f: f.write(pw + "\n")
-# skip-name-resolve is on, so 'localhost' does not match TCP connections from 127.0.0.1: grant both.
-sql = f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-for host in ("localhost", "127.0.0.1"):
-    sql += (f"CREATE USER IF NOT EXISTS '{user}'@'{host}' IDENTIFIED BY '{pw}';\n"
-            f"ALTER USER '{user}'@'{host}' IDENTIFIED BY '{pw}';\n"
-            f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{user}'@'{host}';\n")
-sql += "FLUSH PRIVILEGES;\n"
-p = subprocess.run(["mariadb"], input=sql, text=True, capture_output=True)
-if p.returncode != 0: die("mariadb failed: " + p.stderr.strip())
-print(f"DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\nDB_DATABASE={db}\nDB_USERNAME={user}\nDB_PASSWORD={pw}")
+
+if engine == "mysql":
+    # skip-name-resolve is on, so 'localhost' does not match TCP connections from 127.0.0.1: grant both.
+    sql = f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+    for host in ("localhost", "127.0.0.1"):
+        sql += (f"CREATE USER IF NOT EXISTS '{user}'@'{host}' IDENTIFIED BY '{pw}';\n"
+                f"ALTER USER '{user}'@'{host}' IDENTIFIED BY '{pw}';\n"
+                f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{user}'@'{host}';\n")
+    sql += "FLUSH PRIVILEGES;\n"
+    p = subprocess.run(["mariadb"], input=sql, text=True, capture_output=True)
+    if p.returncode != 0: die("mariadb failed: " + p.stderr.strip())
+    print(f"DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\nDB_DATABASE={db}\nDB_USERNAME={user}\nDB_PASSWORD={pw}")
+else:
+    if not shutil.which("psql"): die("postgresql is not installed (lunova-site installs it through lunova-provision first)")
+
+    def psql(sql, tuples=False):
+        args = ["runuser", "-u", "postgres", "--", "psql", "-v", "ON_ERROR_STOP=1", "-X", "-q"] + (["-tA"] if tuples else [])
+        p = subprocess.run(args + ["-c", sql], text=True, capture_output=True)
+        if p.returncode != 0: die("psql failed: " + p.stderr.strip())
+        return p.stdout.strip()
+
+    if psql(f"SELECT 1 FROM pg_roles WHERE rolname='{user}'", True) != "1": psql(f'CREATE ROLE "{user}" LOGIN PASSWORD \'{pw}\'')
+    else: psql(f'ALTER ROLE "{user}" LOGIN PASSWORD \'{pw}\'')
+    if psql(f"SELECT 1 FROM pg_database WHERE datname='{db}'", True) != "1": psql(f'CREATE DATABASE "{db}" OWNER "{user}" ENCODING \'UTF8\'')
+    print(f"DB_CONNECTION=pgsql\nDB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE={db}\nDB_USERNAME={user}\nDB_PASSWORD={pw}")

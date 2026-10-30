@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""lunova-gate: forced command for the PUBLIC login key used by the shared GitHub workflow.
+
+The login key is public on purpose (it is in the public workflow repo); it opens nothing by itself.
+Access is decided here from the GitHub Actions OIDC token passed with the command:
+  - signature verified against GitHub's JWKS (RS256), issuer, audience, expiry (token is the `LUNOVA_TOKEN=<jwt>` prefix of the command)
+  - repository_owner AND repository_owner_id must be in /srv/registry/config.json allowed_owners
+  - job_workflow_ref must be the shared workflow (so a custom workflow in a repo cannot reach the server)
+Then exactly two commands may run, with the verified identity exported as LUNOVA_REPO / LUNOVA_REF / LUNOVA_EVENT:
+  lunova-site <args...>
+  rsync --server ... . /srv/sites/<site>/releases/<id>/   (only for a site bound to this repo and branch)
+lunova-site enforces per-site ownership from that identity.
+"""
+import base64, json, os, re, shlex, sys, time, urllib.request
+from pathlib import Path
+
+REG = Path("/srv/registry")
+ISS = "https://token.actions.githubusercontent.com"
+AUDIENCE = "lunova"
+LOG = REG / "gate.log"
+
+
+def b64d(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def log(outcome, claims=None, cmd=""):
+    c = claims or {}
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {outcome} repo={c.get('repository', '-')} "
+                    f"ref={c.get('ref', '-')} event={c.get('event_name', '-')} cmd={cmd[:120]!r}\n")
+    except OSError:
+        pass
+
+
+def deny(why, claims=None, cmd=""):
+    log(f"DENY({why})", claims, cmd)
+    print(f"lunova-gate: refused ({why})", file=sys.stderr)
+    sys.exit(126)
+
+
+def cfg():
+    try: return json.loads((REG / "config.json").read_text())
+    except (OSError, ValueError): return {}
+
+
+def jwks(force=False):
+    cache = REG / "jwks.json"
+    if not force and cache.exists() and time.time() - cache.stat().st_mtime < 3600:
+        return json.loads(cache.read_text())
+    try:
+        data = json.load(urllib.request.urlopen(ISS + "/.well-known/jwks", timeout=8))
+        cache.write_text(json.dumps(data))
+        return data
+    except Exception:
+        if cache.exists(): return json.loads(cache.read_text())
+        raise
+
+
+def verify(token):
+    """Return the claims of a valid GitHub OIDC token, or deny."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    try:
+        h, p, s = token.split(".")
+        header, claims = json.loads(b64d(h)), json.loads(b64d(p))
+    except Exception:
+        deny("malformed token")
+    if header.get("alg") != "RS256": deny("bad alg")
+    key = None
+    for force in (False, True):
+        try: keys = jwks(force).get("keys", [])
+        except Exception: deny("cannot load GitHub signing keys")
+        key = next((k for k in keys if k.get("kid") == header.get("kid")), None)
+        if key: break
+    if not key: deny("unknown signing key")
+    pub = rsa.RSAPublicNumbers(int.from_bytes(b64d(key["e"]), "big"), int.from_bytes(b64d(key["n"]), "big")).public_key()
+    try: pub.verify(b64d(s), f"{h}.{p}".encode(), padding.PKCS1v15(), hashes.SHA256())
+    except InvalidSignature: deny("bad signature")
+    now = time.time()
+    aud = claims.get("aud"); aud = aud if isinstance(aud, list) else [aud]
+    if claims.get("iss") != ISS: deny("bad issuer", claims)
+    if AUDIENCE not in aud: deny("bad audience", claims)
+    if not isinstance(claims.get("exp"), (int, float)) or claims["exp"] < now: deny("token expired", claims)
+    if claims.get("nbf", 0) > now + 60: deny("token not yet valid", claims)
+    return claims
+
+
+def authorize(claims):
+    c = cfg()
+    owners = c.get("allowed_owners", {})          # {"lunova-digital": 226854643, ...}
+    owner = str(claims.get("repository_owner", "")).lower()
+    if owner not in owners or str(owners[owner]) != str(claims.get("repository_owner_id")):
+        deny(f"owner '{owner}' is not allowed", claims)
+    prefix = c.get("workflow_prefix", "lunova-digital/lunova-deploy/.github/workflows/deploy.yml@")
+    if not str(claims.get("job_workflow_ref", "")).startswith(prefix):
+        deny("not called from the shared Lunova workflow", claims)
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", str(claims.get("repository", ""))): deny("bad repository claim", claims)
+
+
+def site_binding(site):
+    try: return json.loads((REG / "sites" / f"{site}.json").read_text())
+    except (OSError, ValueError): return None
+
+
+cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+try: argv = shlex.split(cmd)
+except ValueError: deny("unparseable command")
+if not argv: deny("interactive shells are not allowed")
+# The token rides as a prefix of the command (LUNOVA_TOKEN=<jwt> <command...>): no sshd AcceptEnv needed, and for rsync it is
+# delivered with --rsync-path="LUNOVA_TOKEN=<jwt> rsync".
+if not argv[0].startswith("LUNOVA_TOKEN="): deny("no token")
+token = argv.pop(0)[len("LUNOVA_TOKEN="):]
+if not argv: deny("no command")
+cmd = shlex.join(argv)
+claims = verify(token)
+authorize(claims)
+
+env = {k: v for k, v in os.environ.items() if not k.startswith("LUNOVA_")}
+env.update(LUNOVA_REPO=claims["repository"], LUNOVA_REF=str(claims.get("ref", "")), LUNOVA_EVENT=str(claims.get("event_name", "")),
+           LUNOVA_ACTOR=str(claims.get("actor", "")))
+
+if argv[0] == "lunova-site":
+    log("ALLOW", claims, cmd)
+    os.execve("/usr/local/bin/lunova-site", ["lunova-site"] + argv[1:], env)
+
+if argv[0] == "rsync" and len(argv) >= 4 and argv[1] == "--server":
+    ok_long = {"--delete", "--delete-excluded", "--mkpath", "--delete-before", "--delete-during", "--delete-after"}
+    for a in argv[2:-2]:
+        if not (re.fullmatch(r"-[A-Za-z0-9.=,]+", a) or a in ok_long): deny(f"rsync option {a}", claims, cmd)
+    if argv[-2] != ".": deny("rsync source", claims, cmd)
+    m = re.fullmatch(r"/srv/sites/([a-z][a-z0-9-]{1,40})/releases/[A-Za-z0-9._-]{1,64}/?", argv[-1])
+    if not m or ".." in argv[-1]: deny("rsync destination", claims, cmd)
+    d = site_binding(m.group(1))
+    if not d or d.get("repo") != claims["repository"]: deny("site is not registered to this repository", claims, cmd)
+    if d.get("branch") and claims.get("ref") != f"refs/heads/{d['branch']}": deny("upload only from the site's deploy branch", claims, cmd)
+    log("ALLOW", claims, cmd)
+    os.execve("/usr/bin/rsync", ["rsync"] + argv[1:], env)
+
+deny("command not allowed", claims, cmd)
