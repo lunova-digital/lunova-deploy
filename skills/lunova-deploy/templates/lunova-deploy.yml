@@ -4,6 +4,8 @@ name: Lunova deploy
 on:
   push:
     branches: [__BRANCH__]
+  pull_request:            # a PR into the deploy branch runs a safe preflight (mode=check), never a deploy
+    branches: [__BRANCH__]
   workflow_dispatch:
     inputs:
       mode:
@@ -23,6 +25,6 @@ jobs:
   lunova:
     uses: __WORKFLOW_REPO__/.github/workflows/deploy.yml@__WORKFLOW_REF__
     with:
-      mode: ${{ inputs.mode || 'deploy' }}
+      mode: ${{ github.event_name == 'pull_request' && 'check' || inputs.mode || 'deploy' }}
       rollback_to: ${{ inputs.rollback_to || '' }}
     secrets: inherit

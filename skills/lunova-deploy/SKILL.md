@@ -50,7 +50,7 @@ Ask only what you cannot infer: site name (suggest from repo name), production d
 
 ### 4. Preflight
 - Check the org workflow repo from `config.yml` exists and is reachable: `gh repo view <workflow_repo>`. If `workflow_repo` still says `REPLACE_ORG`, or org secrets/variables are not visible to the repo, that is an ops request (one-time Lunova setup).
-- After the files exist (step 5), run the **check** mode to read the server's real capabilities and domain status without deploying: `gh workflow run lunova-deploy.yml -f mode=check`, then `gh run watch` and read the log. Compare `capabilities` with `references/stacks.md`: missing runtime/DB/FPM socket = ops request. DNS problems = ask the developer to fix DNS, or `http_only: true` for a temporary test.
+- After the files exist (step 5), run the **check** mode to read the server's real capabilities and domain status without deploying. `workflow_dispatch` only works for workflows on the default branch, so before the first merge the check runs automatically on the **pull request** (the caller template maps `pull_request` to `mode=check`): open the PR, then `gh run watch` and read the log. After the first merge, `gh workflow run lunova-deploy.yml -f mode=check` also works. Compare `capabilities` with `references/stacks.md`: missing runtime/DB/FPM socket = ops request. DNS problems = ask the developer to fix DNS, or `http_only: true` for a temporary test.
 
 ### 5. Generate (show the files before writing)
 - `.lunova.yml` from `templates/lunova.yml`, filled from discovery and answers, following `references/manifest.md` and the stack recipe.
@@ -59,7 +59,7 @@ Ask only what you cannot infer: site name (suggest from repo name), production d
 - Offer to set `LUNOVA_ENV` (`gh secret set LUNOVA_ENV < file`): build the file from the real `.env` with production-appropriate values (APP_ENV=production, APP_DEBUG=false, correct APP_URL, a generated APP_KEY only if absent). Show only variable names and which ones need the developer's input. Delete any temp file after.
 
 ### 6. Push and verify
-1. With approval: commit, push the `lunova-deploy` branch, open a PR. Run the **check** mode again from the branch if needed.
+1. With approval: commit, push the `lunova-deploy` branch, open a PR. The PR run is the preflight; push fixes to the branch to rerun it.
 2. With approval: merge to the deploy branch (this deploys), or run `gh workflow run lunova-deploy.yml` on the branch for a first deploy.
 3. Watch: `gh run list`, `gh run watch <id>`, show the failing step's log (`gh run view <id> --log-failed`) and diagnose. Typical causes are in `references/troubleshooting.md`.
 4. Verify the live site yourself: `curl -sI https://<domain>` (status, TLS), fetch the home page, check an app-specific route, and report the result. For Laravel also confirm no debug output and that login/queue-dependent pages work if they can be tested.
