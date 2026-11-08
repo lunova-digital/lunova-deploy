@@ -3,7 +3,7 @@ server_ip: 152.42.168.192
 host_fingerprint: SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s
 # Shared workflow repo (public on purpose: private repos on GitHub Free can only call a public reusable workflow; it holds no secrets).
 workflow_repo: lunova-digital/lunova-deploy
-workflow_ref: v3
+workflow_ref: v4
 # The server only accepts repositories owned by these GitHub owners (enforced server-side by lunova-gate).
 allowed_owners: [lunova-digital, jakiurcore]
 # Env values are encrypted with seal.pub.pem (next to this file) by scripts/lunova-seal; only the server can decrypt.

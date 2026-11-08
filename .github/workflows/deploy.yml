@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v3: adds self_hosted). Public on purpose: it contains no secrets.
+# Reusable Lunova deploy workflow (v4: v3 + idempotent key regen for persistent self-hosted runners). Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
 # (lunova-gate) only accepts repositories owned by an allowed owner, running THIS workflow, and binds each site to the
 # repository and branch that first registered it.
@@ -70,6 +70,9 @@ jobs:
         run: |
           set -euo pipefail
           install -d -m 700 ~/.ssh ~/.lunova
+          # Self-hosted runners keep $HOME between jobs (GitHub-hosted ones don't), so a prior run's
+          # key would make ssh-keygen prompt to overwrite and hang. Start clean every time.
+          rm -f ~/.ssh/lunova_key ~/.ssh/lunova_key.pub
           ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/lunova_key          # throwaway key for this run only
           ssh-keyscan -t ed25519 "$LUNOVA_HOST" > ~/.ssh/known_hosts 2>/dev/null
           ssh-keygen -lf ~/.ssh/known_hosts | grep -qF "$LUNOVA_HOST_FPR" \
