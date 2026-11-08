@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v4: v3 + idempotent key regen for persistent self-hosted runners). Public on purpose: it contains no secrets.
+# Reusable Lunova deploy workflow (v5: v4 + no sudo on self-hosted — PHP/Composer are verified, not installed, there). Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
 # (lunova-gate) only accepts repositories owned by an allowed owner, running THIS workflow, and binds each site to the
 # repository and branch that first registered it.
@@ -128,11 +128,27 @@ jobs:
           [ -n "$ROLLBACK_TO" ] && args+=(--to "$ROLLBACK_TO")
           ~/.lunova/lsh "${args[@]}"
 
+      # shivammathur/setup-php installs/switches PHP via sudo apt + update-alternatives, which on a
+      # self-hosted runner means granting it broad root access. We standardize on one PHP version
+      # (php_version in config.yml) everywhere, already provisioned on self-hosted runners, so there is
+      # nothing to install or switch there: verify it matches and fail loudly (an ops request, same as
+      # any other unsupported PHP version) rather than silently reach for sudo.
       - uses: shivammathur/setup-php@v2
-        if: env.MODE == 'deploy' && env.PHP_VERSION != ''
+        if: env.MODE == 'deploy' && env.PHP_VERSION != '' && !inputs.self_hosted
         with:
           php-version: ${{ env.PHP_VERSION }}
           tools: composer:v2
+
+      - name: Verify PHP (self-hosted runners provision one fixed version; no sudo here)
+        if: env.MODE == 'deploy' && env.PHP_VERSION != '' && inputs.self_hosted
+        run: |
+          set -euo pipefail
+          ACTUAL="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+          if [ "$ACTUAL" != "$PHP_VERSION" ]; then
+            echo "::error::This self-hosted runner has PHP ${ACTUAL:-none}, but $SITE needs PHP $PHP_VERSION. That's an ops request (ask whoever manages the runner host to install it) rather than something this job can fix itself."
+            exit 1
+          fi
+          command -v composer >/dev/null || { echo "::error::composer not found on this self-hosted runner. Ops request."; exit 1; }
 
       - uses: actions/setup-node@v4
         if: env.MODE == 'deploy' && env.NODE_VERSION != ''
