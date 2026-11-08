@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v2). Public on purpose: it contains no secrets.
+# Reusable Lunova deploy workflow (v3: adds self_hosted). Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
 # (lunova-gate) only accepts repositories owned by an allowed owner, running THIS workflow, and binds each site to the
 # repository and branch that first registered it.
@@ -22,6 +22,10 @@ on:
         description: "Log lines to show in logs mode"
         type: string
         default: "80"
+      self_hosted:
+        description: "Run on the org's self-hosted [self-hosted, lunova] runners instead of GitHub-hosted ubuntu-latest"
+        type: boolean
+        default: false
 
 # The caller must grant id-token: write (the template does).
 permissions:
@@ -30,7 +34,7 @@ permissions:
 
 jobs:
   lunova:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.self_hosted && fromJSON('["self-hosted", "lunova"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     concurrency:
       group: lunova-${{ github.repository }}

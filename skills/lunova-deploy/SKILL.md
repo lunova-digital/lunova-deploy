@@ -12,7 +12,7 @@ Read `config.yml` (server facts), `references/manifest.md` (`.lunova.yml`) and `
 ## How it works (so you can explain it in one breath)
 
 ```
-git push -> GitHub Actions runs the shared workflow lunova-digital/lunova-deploy@v2
+git push -> GitHub Actions runs the shared workflow lunova-digital/lunova-deploy@v3 (self-hosted or GitHub-hosted, per the answer at setup time)
          -> proves its identity to the server with GitHub's own OIDC token (no key, no secret)
          -> server: registers the site, installs missing packages, creates the database + user + password,
             builds .env, uploads the release, runs hooks, health-checks, switches, auto-rolls back on failure
@@ -48,12 +48,13 @@ Ask only what you cannot infer:
 - **Database**: mysql (default for Laravel), postgres, sqlite, or none. Pre-select what you detected.
 - **Queue worker / scheduler** (Laravel), only if the code uses them.
 - **Deploy branch**: offer the branches you found, default branch first. State the consequence in the question: "Every push to `<branch>` will automatically deploy to https://<domain>. OK, or use a different branch?" If they pick a new branch name, create it from the current one.
+- **Runner**: self-hosted (`self_hosted_runner_labels` in `config.yml`) or GitHub-hosted (`ubuntu-latest`)? Pre-select self-hosted — it's free and that's why it exists. State the one real trade-off: if the self-hosted host is ever down, deploys queue until it's back, instead of falling back to GitHub's runners.
 - **Old deploy workflow**: disable it after the first successful Lunova deploy? (yes/no)
 - **Environment values**: list the names from `.env.example` that need a human value and have no safe default (mail, third-party APIs, payment, analytics). Do not list `APP_*` basics, `DB_*`, cache/queue/session drivers. Ask whether they want to enter them now or later; entering later is a normal one-liner.
 
 ### 3. Generate (show the files, then write them)
 - `.lunova.yml` from `templates/lunova.yml`, following `references/manifest.md` and the stack recipe.
-- `.github/workflows/lunova-deploy.yml` from `templates/lunova-deploy.yml` (`__BRANCH__`, `__WORKFLOW_REPO__`, `__WORKFLOW_REF__` from `config.yml`).
+- `.github/workflows/lunova-deploy.yml` from `templates/lunova-deploy.yml` (`__BRANCH__`, `__WORKFLOW_REPO__`, `__WORKFLOW_REF__` from `config.yml`; `__SELF_HOSTED__` is the literal `true`/`false` from the runner answer above).
 - If values were provided: `printf '%s' '{"set": {...}}' | scripts/lunova-seal --site <site> --repo <owner/repo>` writes `.lunova/env.sealed` (safe to commit). Build the JSON with a heredoc or python, not in a command line. Never print it.
 - Work on a branch `lunova-deploy`; if the developer chose a deploy branch that does not exist yet, create it.
 
