@@ -9,7 +9,7 @@ Lives at the repo root. Read by the shared workflow with `yq`. Unknown keys are 
 | `domains` | yes | List of hostnames. Each needs a DNS A record to the server IP before TLS can be issued. A domain can belong to one site only. |
 | `root` | static/spa | Folder to serve inside the release (e.g. `dist`). Default: release root. |
 | `start` | node/python | Command that listens on `127.0.0.1:$PORT`. No `'`, `%` or newlines. Example: `node server.js`, `.venv/bin/gunicorn app:app -b 127.0.0.1:$PORT`. |
-| `php` / `node` | no | Versions for the CI build (setup-php / setup-node). |
+| `php` / `node` | no | `php` (laravel): runtime and CI build version, `"8.3"` (default), `"8.4"` or `"8.5"`; changing it on a registered site moves it to that PHP-FPM pool on the next deploy. `node`: version for the CI build (setup-node). |
 | `build` | no | Commands CI runs before upload. If omitted: laravel = `composer install --no-dev ...`; node/spa/static = `npm ci` + `npm run build --if-present` when `package.json` exists. |
 | `hooks` | no | Commands run **on the server inside the new release before it goes live**. A failure aborts the release and the live site is unchanged. Omit for per-type defaults, `[]` for none. Defaults: laravel = migrate, config/route/view/event cache, storage:link; node = `npm ci --omit=dev`; python = venv + pip install. |
 | `health_path` | no | Path that must return 2xx/3xx after switching. Default `/`. Failing = automatic rollback. |

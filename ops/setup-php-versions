@@ -1,0 +1,36 @@
+#!/bin/bash
+# ops-only, idempotent. Gives every installed PHP version (8.3, 8.4, 8.5) its own `lunova` FPM pool running as `deploy`,
+# plus a `php` shim dir that lunova-site puts first on PATH for hooks, queue workers and the scheduler of a site.
+#   8.3 -> /run/php/lunova.sock        (legacy name, kept so existing Caddy site files keep working)
+#   8.4 -> /run/php/lunova-8.4.sock,  8.5 -> /run/php/lunova-8.5.sock
+# The stock `www` pools of 8.4/8.5 are left alone and unused (to save RAM: sudo mv /etc/php/8.X/fpm/pool.d/www.conf{,.disabled}).
+# Also pins the system default `php` back to 8.3 so nothing that still calls /usr/bin/php changes version.
+set -euo pipefail
+HOST="${1:-lunova}"
+ssh "$HOST" 'set -e
+for v in 8.4 8.5; do
+  [ -x /usr/sbin/php-fpm$v ] || { echo "php$v-fpm not installed, skipping"; continue; }
+  sudo tee /etc/php/$v/fpm/pool.d/lunova.conf >/dev/null <<POOL
+[lunova]
+user = deploy
+group = deploy
+listen = /run/php/lunova-$v.sock
+listen.owner = caddy
+listen.group = caddy
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 6
+pm.process_idle_timeout = 20s
+pm.max_requests = 500
+php_admin_value[error_log] = /var/log/php$v-fpm-lunova.log
+php_admin_flag[log_errors] = on
+POOL
+  sudo php-fpm$v -t && sudo systemctl reload php$v-fpm
+done
+for v in 8.3 8.4 8.5; do
+  [ -x /usr/bin/php$v ] || continue
+  sudo install -d /usr/local/lib/lunova/php/$v
+  sudo ln -sfn /usr/bin/php$v /usr/local/lib/lunova/php/$v/php
+done
+sudo update-alternatives --set php /usr/bin/php8.3
+ls -l /run/php/*.sock'

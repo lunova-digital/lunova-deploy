@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
+# Reusable Lunova deploy workflow (v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
 # self-hosted runner instances sharing one gh-runner user don't race on each other's key/known_hosts).
 # Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
@@ -140,7 +140,7 @@ jobs:
 
       # shivammathur/setup-php installs/switches PHP via sudo apt + update-alternatives, which on a
       # self-hosted runner means granting it broad root access. We standardize on one PHP version
-      # (php_version in config.yml) everywhere, already provisioned on self-hosted runners, so there is
+      # (php_version in config.yml) by default, with the other supported versions (php_versions) installed alongside, already provisioned on self-hosted runners, so there is
       # nothing to install or switch there: verify it matches and fail loudly (an ops request, same as
       # any other unsupported PHP version) rather than silently reach for sudo.
       - uses: shivammathur/setup-php@v2
@@ -153,6 +153,9 @@ jobs:
         if: env.MODE == 'deploy' && env.PHP_VERSION != '' && inputs.self_hosted
         run: |
           set -euo pipefail
+          # The runner host ships several versions side by side under /usr/local/lib/lunova/php/<ver>/php.
+          SHIM="/usr/local/lib/lunova/php/$PHP_VERSION"
+          if [ -x "$SHIM/php" ]; then echo "$SHIM" >> "$GITHUB_PATH"; export PATH="$SHIM:$PATH"; fi
           ACTUAL="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
           if [ "$ACTUAL" != "$PHP_VERSION" ]; then
             echo "::error::This self-hosted runner has PHP ${ACTUAL:-none}, but $SITE needs PHP $PHP_VERSION. That's an ops request (ask whoever manages the runner host to install it) rather than something this job can fix itself."
@@ -191,6 +194,7 @@ jobs:
           [ "$HTTP_ONLY" = "true" ] && args+=(--http-only)
           db=$(yq -r '.database // ""' "$MANIFEST")
           case "$db" in mysql|postgres|sqlite) args+=(--database "$db") ;; ""|none) ;; *) echo "::error::database must be mysql, postgres, sqlite or none (got '$db')"; exit 1 ;; esac
+          [ -n "$PHP_VERSION" ] && [ "$TYPE" = "laravel" ] && args+=(--php "$PHP_VERSION")
           [ "$(yq -r '.queue // false' "$MANIFEST")" = "true" ] && args+=(--queue)
           [ "$(yq -r '.scheduler // false' "$MANIFEST")" = "true" ] && args+=(--scheduler)
           while IFS= read -r pkg; do [ -n "$pkg" ] && args+=(--package "$pkg"); done < <(yq -r '.packages // [] | .[]' "$MANIFEST")

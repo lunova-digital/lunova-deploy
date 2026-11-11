@@ -30,7 +30,7 @@ git push -> GitHub Actions runs the shared workflow lunova-digital/lunova-deploy
 2. **Environment values are only ever sealed.** Take a value from the developer, pass it to `scripts/lunova-seal` on stdin, never put it in argv, a repo file in plaintext, a commit message or your replies. Never echo values back; refer to names. Read `.env` files only to list names. Delete any temp file.
 3. **Ask before every outward action once**, in plain words, then do the whole sequence without nagging: (a) pushing a branch that will auto-deploy, (b) disabling an old deploy. Do not delete the old deploy setup unless they said yes.
 4. **Repo owner gate**: the GitHub owner of `origin` must be `lunova-digital` or `jakiurcore`. Otherwise stop and tell them to transfer or fork the repo into `lunova-digital` (give the exact `gh repo transfer`/fork command); do not work around it.
-5. Anything the pipeline cannot do is an ops request (DNS they do not control, a PHP version other than 8.3, a package apt refuses). Give them the ready message from `references/ops-requests.md`. Do not invent workarounds.
+5. Anything the pipeline cannot do is an ops request (DNS they do not control, a PHP version other than 8.3, 8.4 or 8.5, a package apt refuses). Give them the ready message from `references/ops-requests.md`. Do not invent workarounds.
 6. Once the push is done, **do not keep checking in**. Give the link, say what to expect, stop.
 
 ## Process

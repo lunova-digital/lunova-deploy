@@ -52,6 +52,6 @@ with open(LOG, "a") as f:
 if r.returncode != 0:
     die(f"apt-get failed for {' '.join(missing)}:\n{(r.stdout + r.stderr)[-1500:]}")
 if any(p.startswith("php") for p in missing):
-    for svc in [s for s in ("php8.3-fpm",) if shutil.which("systemctl")]:
+    for svc in [s for s in ("php8.3-fpm", "php8.4-fpm", "php8.5-fpm") if shutil.which("systemctl")]:
         subprocess.run(["systemctl", "reload", svc], capture_output=True)
 print("installed: " + " ".join(missing))

@@ -7,7 +7,7 @@ domains:
 # --- optional ---
 # root: dist                  # static/spa: folder to serve, relative to the release
 # start: node server.js       # node/python: command that listens on $PORT (127.0.0.1)
-# php: "8.3"                  # laravel: PHP used by the CI build
+# php: "8.3"                  # laravel: PHP for CI build and server runtime: "8.3" (default), "8.4" or "8.5"
 # node: "22"                  # Node used by the CI build
 # build:                      # commands CI runs before upload (defaults per type if omitted)
 #   - composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction

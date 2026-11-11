@@ -95,7 +95,26 @@ def listening_ports():
 def caddy_reload(): run(["sudo", "-n", "/usr/local/sbin/caddy-reload"])
 
 
-def php_socket(): return cfg().get("php_socket", "/run/php/lunova.sock")
+PHP_VERSIONS = ("8.3", "8.4", "8.5")
+PHP_DEFAULT = "8.3"
+PHP_SHIMS = Path("/usr/local/lib/lunova/php")  # <ver>/php -> /usr/bin/php<ver>, created by ops/setup-php-versions
+
+
+def php_ver(d): return str((d or {}).get("php") or PHP_DEFAULT)
+
+
+def php_socket(ver=PHP_DEFAULT):
+    # 8.3 keeps its legacy socket name so existing Caddy files stay valid; the others are /run/php/lunova-<ver>.sock
+    if ver == PHP_DEFAULT: return cfg().get("php_socket", "/run/php/lunova.sock")
+    return f"/run/php/lunova-{ver}.sock"
+
+
+def php_bin(ver): return str(PHP_SHIMS / ver / "php")
+
+
+def php_env(ver):
+    """Environment that makes `php` (and composer, artisan, ...) resolve to the site's PHP version."""
+    return {**os.environ, "PATH": f"{PHP_SHIMS / ver}:{os.environ.get('PATH', '')}"}
 
 
 def render_caddy(site, d):
@@ -109,7 +128,7 @@ def render_caddy(site, d):
     elif t in ("node", "python"):
         body = f"\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{d['port']}\n"
     else:  # laravel
-        body = (f"\troot * {cur}/public\n\tencode zstd gzip\n\tphp_fastcgi unix/{php_socket()} {{\n"
+        body = (f"\troot * {cur}/public\n\tencode zstd gzip\n\tphp_fastcgi unix/{php_socket(php_ver(d))} {{\n"
                 f"\t\tresolve_root_symlink\n\t}}\n\tfile_server\n")
     return f"# managed by lunova-site (site: {site}, repo: {d.get('repo', '-')})\n{hosts} {{\n{body}}}\n"
 
@@ -122,16 +141,16 @@ def render_unit(site, d):
             f"Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n")
 
 
-def render_queue_unit(site):
+def render_queue_unit(site, ver):
     return (f"[Unit]\nDescription=Lunova queue worker {site}\nAfter=network.target\n\n[Service]\n"
             f"WorkingDirectory=/srv/sites/{site}/current\n"
-            "ExecStart=/usr/bin/php artisan queue:work --sleep=3 --tries=3 --max-time=3600\n"
+            f"ExecStart={php_bin(ver)} artisan queue:work --sleep=3 --tries=3 --max-time=3600\n"
             "Restart=always\nRestartSec=3\nMemoryMax=300M\n\n[Install]\nWantedBy=default.target\n")
 
 
-def render_schedule_units(site):
+def render_schedule_units(site, ver):
     svc = (f"[Unit]\nDescription=Lunova scheduler tick {site}\n\n[Service]\nType=oneshot\n"
-           f"WorkingDirectory=/srv/sites/{site}/current\nExecStart=/usr/bin/php artisan schedule:run\n")
+           f"WorkingDirectory=/srv/sites/{site}/current\nExecStart={php_bin(ver)} artisan schedule:run\n")
     tmr = (f"[Unit]\nDescription=Lunova scheduler {site} (every minute)\n\n[Timer]\nOnCalendar=*-*-* *:*:00\n"
            "AccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n")
     return svc, tmr
@@ -143,11 +162,11 @@ def sync_workers(site, d):
     q, sch = UNITS / f"site-{site}-queue.service", UNITS / f"site-{site}-schedule.service"
     tm = UNITS / f"site-{site}-schedule.timer"
     if d.get("queue") and d["type"] == "laravel":
-        q.write_text(render_queue_unit(site)); run(["systemctl", "--user", "enable", q.name], check=False)
+        q.write_text(render_queue_unit(site, php_ver(d))); run(["systemctl", "--user", "enable", q.name], check=False)
     elif q.exists():
         run(["systemctl", "--user", "disable", "--now", q.name], check=False); q.unlink()
     if d.get("scheduler") and d["type"] == "laravel":
-        svc, tmr = render_schedule_units(site); sch.write_text(svc); tm.write_text(tmr)
+        svc, tmr = render_schedule_units(site, php_ver(d)); sch.write_text(svc); tm.write_text(tmr)
         run(["systemctl", "--user", "enable", tm.name], check=False)
     elif tm.exists():
         run(["systemctl", "--user", "disable", "--now", tm.name], check=False); tm.unlink(missing_ok=True); sch.unlink(missing_ok=True)
@@ -164,29 +183,32 @@ def provision(pkgs):
     say(p.stdout.strip())
 
 
-DB_PHP_EXT = {"mysql": "php8.3-mysql", "postgres": "php8.3-pgsql", "sqlite": "php8.3-sqlite3"}
+DB_PHP_EXT = {"mysql": "php{v}-mysql", "postgres": "php{v}-pgsql", "sqlite": "php{v}-sqlite3"}
 # composer "ext-*" -> Ubuntu package. Core/always-present extensions are not listed.
-EXT_PKG = {"mbstring": "php8.3-mbstring", "xml": "php8.3-xml", "dom": "php8.3-xml", "simplexml": "php8.3-xml", "xmlreader": "php8.3-xml",
-           "xmlwriter": "php8.3-xml", "curl": "php8.3-curl", "zip": "php8.3-zip", "gd": "php8.3-gd", "intl": "php8.3-intl",
-           "bcmath": "php8.3-bcmath", "pdo_mysql": "php8.3-mysql", "mysqli": "php8.3-mysql", "mysqlnd": "php8.3-mysql",
-           "pdo_pgsql": "php8.3-pgsql", "pgsql": "php8.3-pgsql", "pdo_sqlite": "php8.3-sqlite3", "sqlite3": "php8.3-sqlite3",
-           "redis": "php8.3-redis", "imagick": "php8.3-imagick", "gmp": "php8.3-gmp", "soap": "php8.3-soap", "exif": "php8.3-common",
-           "opcache": "php8.3-opcache", "ldap": "php8.3-ldap", "imap": "php8.3-imap", "memcached": "php8.3-memcached", "apcu": "php8.3-apcu"}
+EXT_PKG = {"mbstring": "php{v}-mbstring", "xml": "php{v}-xml", "dom": "php{v}-xml", "simplexml": "php{v}-xml", "xmlreader": "php{v}-xml",
+           "xmlwriter": "php{v}-xml", "curl": "php{v}-curl", "zip": "php{v}-zip", "gd": "php{v}-gd", "intl": "php{v}-intl",
+           "bcmath": "php{v}-bcmath", "pdo_mysql": "php{v}-mysql", "mysqli": "php{v}-mysql", "mysqlnd": "php{v}-mysql",
+           "pdo_pgsql": "php{v}-pgsql", "pgsql": "php{v}-pgsql", "pdo_sqlite": "php{v}-sqlite3", "sqlite3": "php{v}-sqlite3",
+           "redis": "php{v}-redis", "imagick": "php{v}-imagick", "gmp": "php{v}-gmp", "soap": "php{v}-soap", "exif": "php{v}-common",
+           "opcache": "php{v}-opcache", "ldap": "php{v}-ldap", "imap": "php{v}-imap", "memcached": "php{v}-memcached", "apcu": "php{v}-apcu"}
+
+
+def ext_pkg(table, key, ver): return table[key].format(v=ver)
 
 
 def ensure_runtime(site, d, rel):
     """Before hooks run: make sure the server can actually run this release (extensions, DB engine, declared packages)."""
     pkgs = list(d.get("packages", []))
     if d["type"] == "laravel":
-        if d.get("database") in DB_PHP_EXT: pkgs.append(DB_PHP_EXT[d["database"]])
+        if d.get("database") in DB_PHP_EXT: pkgs.append(ext_pkg(DB_PHP_EXT, d["database"], php_ver(d)))
         if (rel / "composer.lock").exists() and shutil.which("composer"):
-            p = run(["composer", "check-platform-reqs", "--no-dev", "--format=json", "--no-interaction"], cwd=rel, check=False)
+            p = run(["composer", "check-platform-reqs", "--no-dev", "--format=json", "--no-interaction"], cwd=rel, check=False, env=php_env(php_ver(d)))
             try: rows = json.loads(p.stdout or "[]")
             except ValueError: rows = []
             for r in rows:
                 if r.get("status") != "missing" or not str(r.get("name", "")).startswith("ext-"): continue
                 ext = r["name"][4:]
-                if ext in EXT_PKG: pkgs.append(EXT_PKG[ext])
+                if ext in EXT_PKG: pkgs.append(ext_pkg(EXT_PKG, ext, php_ver(d)))
                 else: die(f"the project needs PHP extension '{ext}' which Lunova does not know how to install. Add the apt package to `packages:` in .lunova.yml.")
     if d.get("database") == "postgres": pkgs += ["postgresql", "postgresql-client"]
     provision(pkgs)
@@ -262,6 +284,8 @@ def cmd_capabilities(a):
         return p.stdout.splitlines()[0].strip() if p and p.stdout else None
     caps = {
         "node": ver("node"), "npm": ver("npm"), "python3": ver("python3"), "php": ver("php"), "composer": ver("composer"),
+        "php_versions": [v for v in PHP_VERSIONS if os.path.exists(php_socket(v)) and (PHP_SHIMS / v / "php").exists()],
+        "php_default": PHP_DEFAULT,
         "php_fpm_socket": php_socket() if os.path.exists(php_socket()) else None,
         "mysql_client": bool(shutil.which("mysql")), "postgres_client": bool(shutil.which("psql")),
         "disk_free_gb": round(shutil.disk_usage("/srv").free / 1e9, 1),
@@ -314,12 +338,17 @@ def cmd_register(a):
     for h in domains:
         for s, d in sites.items():
             if s != a.site and h in d["domains"]: die(f"domain {h} is already used by site '{s}'")
-    if a.type == "laravel" and not os.path.exists(php_socket()):
-        die(f"PHP-FPM socket {php_socket()} not found: ops must set up PHP-FPM first (see ops request: laravel)")
+    php = str(a.php or (old or {}).get("php") or PHP_DEFAULT)
+    if php not in PHP_VERSIONS: die(f"php must be one of {', '.join(PHP_VERSIONS)} (got '{php}')")
+    if a.type == "laravel":
+        if not os.path.exists(php_socket(php)):
+            die(f"PHP-FPM socket {php_socket(php)} not found: ops must set up the PHP {php} pool first (see ops request: PHP version)")
+        if not (PHP_SHIMS / php / "php").exists():
+            die(f"PHP {php} shim {php_bin(php)} not found: ops must run ops/setup-php-versions")
     d = {"site": a.site, "type": a.type, "domains": domains, "repo": a.repo or (old or {}).get("repo"),
          "root": a.root or "", "http_only": bool(a.http_only), "health_path": a.health_path,
          "hooks": a.hook if a.hook is not None else DEFAULT_HOOKS.get(a.type, []),
-         "database": a.database, "queue": bool(a.queue), "scheduler": bool(a.scheduler), "packages": sorted(set(pkgs)),
+         "php": php if a.type == "laravel" else None, "database": a.database, "queue": bool(a.queue), "scheduler": bool(a.scheduler), "packages": sorted(set(pkgs)),
          "branch": branch}
     if (a.queue or a.scheduler) and a.type != "laravel": die("--queue/--scheduler are only supported for laravel sites")
     if a.type in ("node", "python"):
@@ -421,7 +450,7 @@ def cmd_release(a):
     prev = current_target(a.site)
     for h in d.get("hooks", []):
         say(f"hook: {h}")
-        p = run(["bash", "-c", h], cwd=rel, check=False)
+        p = run(["bash", "-c", h], cwd=rel, check=False, env=php_env(php_ver(d)) if d["type"] == "laravel" else None)
         if p.returncode != 0:
             say(p.stdout + p.stderr); die(f"hook failed: {h} (nothing was switched; the live site is unchanged)")
     switch(a.site, rel)
@@ -567,7 +596,7 @@ def main():
     r = sp.add_parser("register"); r.add_argument("--site", required=True); r.add_argument("--type", required=True)
     r.add_argument("--domains", required=True); r.add_argument("--repo"); r.add_argument("--start"); r.add_argument("--root")
     r.add_argument("--database", choices=["mysql", "postgres", "sqlite"]); r.add_argument("--package", action="append")
-    r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
+    r.add_argument("--php"); r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
     r.add_argument("--health-path", default="/"); r.add_argument("--hook", action="append"); r.add_argument("--http-only", action="store_true")
     r.set_defaults(f=cmd_register)
     x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)

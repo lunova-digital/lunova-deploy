@@ -16,7 +16,7 @@
 | 502 from Caddy after deploy | app crashed/started on wrong port | `start` must use `$PORT` |
 | Certificate/HTTPS error on first visit | DNS not pointing at server yet or still propagating | `mode=check`, fix DNS, wait, retry |
 | `Could not resolve to a Repository` (gh) | wrong gh account / no access | `gh auth status`, `gh auth switch` |
-| `requires php >=8.4` during composer install | lock resolved on a newer PHP than the server's 8.3 | add `config.platform.php = 8.3.0` to composer.json and `composer update` (see stacks.md) |
+| `requires php >=8.4` during composer install | lock resolved on a newer PHP than the site's `php:` version (default 8.3) | set `php:` to 8.4/8.5 in the manifest, or add `config.platform.php` matching it to composer.json and `composer update` (see stacks.md) |
 | `Access denied for user` / SQLSTATE[HY000] [1045] | `database:` missing in `.lunova.yml`, or the app ignores `DB_*` (hard-coded config) | set `database:`; use `env('DB_...')` in config |
 | `DB_x is managed by the server` | a sealed patch tried to set DB_* | remove DB_* from the patch; the server generates them |
 | `could not install <pkg>` / `not deployment tooling` | apt refused or the package does not exist | fix the name in `packages:`, or ops request #2 |

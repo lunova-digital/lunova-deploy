@@ -9,7 +9,7 @@ Not an ops message: the server accepts only repos owned by `lunova-digital` or `
 > Site `<site>` is bound to `<owner/repo>` branch `<old>`. Please re-bind it to branch `<new>`: edit `branch` in `/srv/registry/sites/<site>.json` (and `repo` if the repo was renamed/transferred).
 
 ## 2. Runtime missing (from `mode=check`)
-> Site `<site>` (<type>) needs something the pipeline cannot install by itself (`<PHP other than 8.3 | Node other than 22 | a package apt refused: name + message>`). Capabilities / error output: `<paste the lines>`.
+> Site `<site>` (<type>) needs something the pipeline cannot install by itself (`<PHP other than 8.3/8.4/8.5 | Node other than 22 | a package apt refused: name + message>`). Capabilities / error output: `<paste the lines>`.
 
 ## 3. DNS
 > Please point `<domain>` (and `www.<domain>`) A record to `152.42.168.192`. If the zone is on Cloudflare: set the record to **DNS-only (grey cloud)** until the first HTTPS deploy has issued the certificate, then enable the proxy and set SSL mode to Full (strict). Needed before the first HTTPS deploy.
