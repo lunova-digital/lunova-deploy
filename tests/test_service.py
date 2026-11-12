@@ -111,3 +111,30 @@ class SiteService(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublicAdminName(unittest.TestCase):
+    def setUp(self):
+        self.s = load("lunova-site")
+
+    def test_caddy_file_publishes_only_admin_paths_behind_basic_auth(self):
+        d = {"host_port": 8080, "public": {"host": "signal.lunovadigital.net", "user": "lunova", "paths": ["/v1/about", "/v1/qrcodelink"]}}
+        out = self.s.render_service_caddy("lunova-signal", d, "$2a$14$hash")
+        self.assertIn("signal.lunovadigital.net {", out)
+        self.assertIn("@admin path /v1/about /v1/qrcodelink", out)
+        self.assertIn("basicauth", out); self.assertIn("lunova $2a$14$hash", out)
+        self.assertIn("reverse_proxy 127.0.0.1:8080", out)
+        self.assertIn("respond 404", out)                      # everything else is not found
+        self.assertNotIn("/v2/send", out); self.assertNotIn("receive", out)
+
+    def test_register_refuses_message_paths_and_bad_hosts(self):
+        def reg(**kw):
+            base = dict(site="lunova-signal", type="service", domains="", repo=None, image="x/y:1", container_port=8080, host_port=8080,
+                        env=None, volume=None, memory=512, public_host="signal.lunovadigital.net", public_path=None, public_user=None,
+                        database=None, package=None, php=None, queue=False, scheduler=False, health_path="/", hook=None, http_only=False, start=None, root=None)
+            base.update(kw); return mock.Mock(**base)
+        with mock.patch.object(self.s, "all_sites", lambda: {}), mock.patch.object(self.s.shutil, "which", lambda x: "/usr/bin/docker"), \
+                mock.patch.object(self.s.os.path, "exists", lambda p: True):
+            for bad in (["/v2/send"], ["/v1/receive/+880"], ["/v1/qrcodelink/../../v2/send"], ["/*"], ["/v1/groups"]):
+                with self.assertRaises(SystemExit): self.s.cmd_register(reg(public_path=bad))
+            with self.assertRaises(SystemExit): self.s.cmd_register(reg(public_host="not a host"))

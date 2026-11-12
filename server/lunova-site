@@ -28,6 +28,10 @@ CLOUDFLARE = [ipaddress.ip_network(n) for n in (
     "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22")]
 DB_KEYS = ("DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_DATABASE", "DB_USERNAME", "DB_PASSWORD")
 PORTS = range(3100, 4000)
+# The ONLY paths a service may publish on its public name (admin/authentication work such as linking the Signal account).
+# Message traffic (send/receive/groups/...) is never reachable from outside: the hub calls the container on 127.0.0.1.
+PUBLIC_OK = ("/v1/qrcodelink", "/v1/register", "/v1/accounts", "/v1/about", "/v1/health")
+PUBLIC_PW_KEY = "LUNOVA_PUBLIC_PASSWORD"  # sealed env value; never passed to the container
 DEFAULT_HOOKS = {
     "laravel": ["php artisan migrate --force", "php artisan config:cache", "php artisan route:cache",
                 "php artisan view:cache", "php artisan event:cache", "php artisan storage:link --force"],
@@ -248,6 +252,15 @@ def render_caddy(site, d):
         body = (f"\troot * {cur}/public\n\tencode zstd gzip\n\tphp_fastcgi unix/{php_socket(php_ver(d))} {{\n"
                 f"\t\tresolve_root_symlink\n\t}}\n\tfile_server\n")
     return f"# managed by lunova-site (site: {site}, repo: {d.get('repo', '-')})\n{hosts} {{\n{body}}}\n"
+
+
+def render_service_caddy(site, d, pw_hash):
+    """Public face of an internal service: only the allow-listed admin paths, behind basic auth. Everything else is a 404."""
+    pub = d["public"]
+    paths = " ".join(pub["paths"])
+    return (f"# managed by lunova-site (service {site}; admin paths only, message traffic stays internal)\n{pub['host']} {{\n"
+            f"\tencode zstd gzip\n\t@admin path {paths}\n\thandle @admin {{\n\t\tbasicauth {{\n\t\t\t{pub['user']} {pw_hash}\n\t\t}}\n"
+            f"\t\treverse_proxy 127.0.0.1:{d['host_port']}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}\n")
 
 
 def render_unit(site, d):
@@ -508,7 +521,24 @@ def cmd_register(a):
         host_port = a.host_port or (old or {}).get("host_port") or next((p for p in PORTS if p not in used and p not in listening_ports()), None)
         if not host_port: die("no free port available")
         if host_port in used: die(f"port {host_port} belongs to another site")
-        d.update({"image": a.image, "container_port": a.container_port, "host_port": int(host_port), "env": env, "volumes": a.volume or [], "memory_mb": a.memory})
+        public = None
+        if a.public_host:
+            ph = a.public_host.lower()
+            if not HOST_RE.match(ph): die(f"invalid public host '{ph}'")
+            for s_, x in sites.items():
+                if s_ != a.site and ph in x.get("domains", []): die(f"{ph} is already used by site '{s_}'")
+                if s_ != a.site and (x.get("public") or {}).get("host") == ph: die(f"{ph} is already used by site '{s_}'")
+            paths = a.public_path or ["/v1/qrcodelink", "/v1/register/*", "/v1/accounts", "/v1/about", "/v1/health"]
+            for pth in paths:
+                if not re.fullmatch(r"/[A-Za-z0-9._~/*-]{0,100}", pth) or ".." in pth or not any(pth == ok or pth.startswith(ok + "/") for ok in PUBLIC_OK):
+                    die(f"public path '{pth}' is not allowed: a service may publish only {', '.join(PUBLIC_OK)} (message traffic is never public)")
+            if len(paths) > 12: die("at most 12 public paths")
+            user = a.public_user or "lunova"
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", user): die("invalid public user")
+            public = {"host": ph, "paths": sorted(set(paths)), "user": user}
+        elif old and (old.get("public") or {}).get("host"):
+            (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); caddy_reload()   # the public name was removed from the manifest
+        d.update({"image": a.image, "container_port": a.container_port, "host_port": int(host_port), "env": env, "volumes": a.volume or [], "memory_mb": a.memory, "public": public})
         if not d["container_port"]: die("--container-port is required for a service")
         base = SITES / a.site
         for sub in ("releases", "shared"): (base / sub).mkdir(parents=True, exist_ok=True)
@@ -592,11 +622,34 @@ def health(site, d):
     return last, url
 
 
+def publish_service(site, d):
+    """Write the Caddy site for the service's public admin name. The password is a sealed value, hashed here; only the hash is written."""
+    base = SITES / site / "shared" / ".env.base"
+    pw = unquote_env(parse_env(base.read_text()).get(PUBLIC_PW_KEY, "")) if base.exists() else ""
+    if len(pw) < 16: die(f"set {PUBLIC_PW_KEY} (at least 16 characters) as a sealed env value: the public admin name is protected by it")
+    p = run(["caddy", "hash-password", "--plaintext", pw], check=False)
+    h = p.stdout.strip()
+    if p.returncode != 0 or not h.startswith("$"): die("could not hash the admin password (is caddy installed on this server?)")
+    CADDY.mkdir(parents=True, exist_ok=True)
+    f = CADDY / f"{site}.caddy"; f.write_text(render_service_caddy(site, d, h))
+    try: caddy_reload()
+    except SystemExit:
+        f.unlink(missing_ok=True); raise
+    say(f"published https://{d['public']['host']} (admin paths only: {' '.join(d['public']['paths'])})")
+
+
+def unquote_env(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"': return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1), v[1:-1])
+    return v
+
+
 def release_service(a, d, rel):
     """A service is a container: the release is its configuration. Start it, check health, switch; on any failure put the previous one back."""
     build_env(a.site)
     (rel / ".lunova-service.json").write_text(json.dumps(service_spec(d), sort_keys=True))
     prev = current_target(a.site)
+    if d.get("public"): publish_service(a.site, d)
 
     def restore():
         if prev: switch(a.site, prev); container("up", a.site, os.path.basename(prev), check=False); say(f"restored {os.path.basename(prev)}")
@@ -789,7 +842,9 @@ def cmd_unregister(a):
         for t in dk("images", "--format", "{{.Repository}}:{{.Tag}}", f"lunova-{a.site}", check=False).stdout.split(): dk("rmi", t, check=False)
         say("container and images removed (named data volumes are kept)")
     if d["type"] == "service":
-        container("down", a.site, check=False); reg_path(a.site).unlink(); say(f"unregistered {a.site} (its data volumes are kept)"); result(ok=True, site=a.site); return
+        container("down", a.site, check=False); reg_path(a.site).unlink()
+        if d.get("public"): (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); caddy_reload()
+        say(f"unregistered {a.site} (its data volumes are kept)"); result(ok=True, site=a.site); return
     d2 = {**d, "queue": False, "scheduler": False}; sync_workers(a.site, d2)
     (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); reg_path(a.site).unlink(); caddy_reload()
     say(f"unregistered {a.site}"); result(ok=True, site=a.site)
@@ -805,6 +860,7 @@ def main():
     r.add_argument("--php"); r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
     r.add_argument("--health-path", default="/"); r.add_argument("--hook", action="append"); r.add_argument("--http-only", action="store_true")
     r.add_argument("--image"); r.add_argument("--container-port", type=int); r.add_argument("--host-port", type=int)
+    r.add_argument("--public-host"); r.add_argument("--public-path", action="append"); r.add_argument("--public-user")
     r.add_argument("--env", action="append"); r.add_argument("--volume", action="append"); r.add_argument("--memory", type=int, default=512)
     r.set_defaults(f=cmd_register)
     x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)

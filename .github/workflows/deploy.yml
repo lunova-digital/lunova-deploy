@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v8: v7 + `type: docker`, a public site built from the project Dockerfile in CI and run in rootless Docker, plus `type: service`, an internal allow-listed container with no domain (e.g. the Signal gateway); v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
+# Reusable Lunova deploy workflow (v9: v8 + an optional `public:` block on a service: its admin paths on a public name behind basic auth; v8: v7 + `type: docker`, a public site built from the project Dockerfile in CI and run in rootless Docker, plus `type: service`, an internal allow-listed container with no domain (e.g. the Signal gateway); v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
 # self-hosted runner instances sharing one gh-runner user don't race on each other's key/known_hosts).
 # Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
@@ -198,6 +198,13 @@ jobs:
             mem=$(yq -r '.memory_mb // ""' "$MANIFEST"); [ -n "$mem" ] && args+=(--memory "$mem")
             while IFS= read -r kv; do [ -n "$kv" ] && args+=(--env "$kv"); done < <(yq -r '.env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "$MANIFEST")
             while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done < <(yq -r '.volumes // [] | .[]' "$MANIFEST")
+            # optional public admin name (e.g. to link the Signal account from a browser): only allow-listed admin paths, behind basic auth
+            ph=$(yq -r '.public.host // ""' "$MANIFEST")
+            if [ -n "$ph" ]; then
+              args+=(--public-host "$ph")
+              pu=$(yq -r '.public.user // ""' "$MANIFEST"); [ -n "$pu" ] && args+=(--public-user "$pu")
+              while IFS= read -r pp; do [ -n "$pp" ] && args+=(--public-path "$pp"); done < <(yq -r '.public.paths // [] | .[]' "$MANIFEST")
+            fi
           fi
           if [ "$TYPE" = "docker" ]; then
             # a public site whose app is a container built from the project's Dockerfile (in CI, below). Secrets go in .lunova/env.sealed.
@@ -274,5 +281,5 @@ jobs:
           {
             echo "### Lunova deploy: $SITE"
             echo "- Release: \`$RELEASE_ID\`"
-            if [ "$TYPE" = "service" ]; then echo "- internal service (no domain), image \`$(yq -r '.image' "$MANIFEST")\`"; else IFS=, read -ra D <<< "$DOMAINS"; for d in "${D[@]}"; do echo "- https://$d"; done; fi
+            if [ "$TYPE" = "service" ]; then echo "- internal service, image \`$(yq -r '.image' "$MANIFEST")\`"; ph=$(yq -r '.public.host // ""' "$MANIFEST"); [ -n "$ph" ] && echo "- admin name (login required, admin paths only): https://$ph"; else IFS=, read -ra D <<< "$DOMAINS"; for d in "${D[@]}"; do echo "- https://$d"; done; fi
           } >> "$GITHUB_STEP_SUMMARY"

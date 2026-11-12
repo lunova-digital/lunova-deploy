@@ -79,7 +79,7 @@ def shared_env(site):
     if f.exists():
         for line in f.read_text().splitlines():
             m = re.match(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*)$", line)
-            if m: out[m.group(1)] = unquote(m.group(2))
+            if m and not m.group(1).startswith("LUNOVA_"): out[m.group(1)] = unquote(m.group(2))  # LUNOVA_* are for the platform (e.g. the admin password), never the container
     return out
 
 

@@ -24,6 +24,7 @@ Lives at the repo root. Read by the shared workflow with `yq`. Unknown keys are 
 | `container_port` / `host_port` | service | Port inside the container / port on the server. The container is published on `127.0.0.1:<host_port>` ONLY, so only things on the server (the hub) reach it. `host_port` is picked automatically when omitted. |
 | `env` | service | Fixed non-secret environment, `KEY: value`. Secrets go in `.lunova/env.sealed` like any site. |
 | `volumes` | service | Named data volumes, `name:/path/in/container` (at most 4). Kept across releases, rollbacks and `unregister`. Host paths can never be mounted. |
+| `public` | service | Optional `host`, `user` (default `lunova`), `paths` (default: the Signal linking paths). Publishes ONLY allow-listed admin paths of the container (`/v1/qrcodelink`, `/v1/register`, `/v1/accounts`, `/v1/about`, `/v1/health`) on that HTTPS name behind basic auth, so the account can be set up from a browser. Message traffic (send/receive/groups) is never public. The password is the sealed env value `LUNOVA_PUBLIC_PASSWORD` (16+ characters, never in git, never passed to the container). Needs a DNS A record to the server. |
 | `memory_mb` | service | Memory limit (default 512, capped by ops). |
 | `http_only` | no | Serve over plain HTTP (no certificate). Testing only. |
 
