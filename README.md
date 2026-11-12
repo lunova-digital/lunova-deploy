@@ -33,7 +33,7 @@ A site can be an **internal container** instead of a web site: no domain, no cer
 - Manifest keys: `image` (exact tag, never `latest`), `container_port`, `host_port`, `env`, `volumes`, `memory_mb`, `health_path`. See `skills/lunova-deploy/references/manifest.md`.
 - **Docker is root-equivalent, so `deploy` never gets it.** `lunova-site` calls `sudo lunova-container up|down|status|logs <site>`, a root helper that re-validates everything against `/etc/lunova/containers.json` (editable by root only): image must be on the allow-list and pinned; ports are loopback-only; memory capped; no host mounts (named volumes only); fixed small capability set; no privileged mode, no host network.
 - A release is the container configuration (`.lunova-service.json` inside the release). Deploy = start, health-check, switch; any failure restarts the previous configuration. An unchanged configuration never restarts the container (a README-only push is harmless). Rollback and `status`/`logs` work as for other sites. `unregister` stops the container and keeps its data volumes.
-- Enable once: `ops/setup-containers [host] [image...]`. To allow another image, ops add it to `allowed_images`.
+- Enable once: `ops/setup-containers [host] [image...]` (it also installs the v8 `lunova-site`; until that is installed on the server a `type: service` deploy stops at `register: the following arguments are required: --domains`, which is how you recognise the old tool). To allow another image, ops add it to `allowed_images`.
 - Secrets for a service travel as sealed env like any site; they are written to a root-only temp env-file for `docker run` and removed.
 
 ## Known limits

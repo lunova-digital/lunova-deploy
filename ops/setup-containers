@@ -3,6 +3,7 @@
 # started by `lunova-site` through a root helper. First use: the Signal gateway (repo lunova-digital/lunova-signal-gateway).
 #
 # What it changes on the server:
+#   * installs the v8 `lunova-site` (/usr/local/bin) - REQUIRED: the old one does not know `type: service`; it stays compatible with existing sites
 #   * installs Docker (Ubuntu `docker.io`); the `deploy` user is NOT added to the docker group (that would be root access)
 #   * installs /usr/local/sbin/lunova-container (root helper) and a sudoers rule letting `deploy` run ONLY that helper
 #   * writes /etc/lunova/containers.json: the image allow-list and limits. Only root edits it. Add an image by editing it.
@@ -11,12 +12,13 @@ set -euo pipefail
 HOST="${1:-lunova}"; shift || true
 IMAGES=("${@:-bbernhard/signal-cli-rest-api}")
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-scp -q "$HERE/server/lunova-container" "$HOST:/tmp/lunova-container"
+scp -q "$HERE/server/lunova-container" "$HERE/server/lunova-site" "$HOST:/tmp/"
 ALLOW=$(printf '"%s",' "${IMAGES[@]}"); ALLOW="[${ALLOW%,}]"
 ssh "$HOST" "set -e
 command -v docker >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io; }
 sudo systemctl enable --now docker
 sudo install -m 755 -o root -g root /tmp/lunova-container /usr/local/sbin/lunova-container && rm -f /tmp/lunova-container
+sudo install -m 755 -o root -g root /tmp/lunova-site /usr/local/bin/lunova-site && rm -f /tmp/lunova-site
 sudo install -d -m 755 /etc/lunova
 if [ -f /etc/lunova/containers.json ]; then echo 'kept existing /etc/lunova/containers.json (edit it to add images)'; else
   printf '{\"allowed_images\": $ALLOW, \"max_memory_mb\": 1024, \"min_host_port\": 1024}\n' | sudo tee /etc/lunova/containers.json >/dev/null; fi
