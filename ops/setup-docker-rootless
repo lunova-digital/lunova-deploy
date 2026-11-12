@@ -1,0 +1,74 @@
+#!/bin/bash
+# ops-only, one time, idempotent. Enables `type: docker` sites: the project's own Dockerfile is built in CI, shipped to the server,
+# and run in a ROOTLESS Docker daemon owned by the `deploy` user (systemd --user service; lingering is already on). A container
+# escape lands as `deploy`, never root. This is separate from the root daemon that `type: service` (ops/setup-containers) uses.
+#   * apt: uidmap slirp4netns dbus-user-session (small, standard)
+#   * Docker static binaries (docker + rootless-extras, pinned version) into ~deploy/bin, from download.docker.com
+#   * AppArmor profile letting ~deploy/bin/rootlesskit create a user namespace (Ubuntu 24.04 blocks it otherwise)
+#   * ~deploy/.config/systemd/user/docker.service, enabled and started
+#   * installs the current lunova-site (it knows `type: docker`)
+# Usage: ops/setup-docker-rootless [ssh-host]      (DOCKER_VERSION=27.5.1 by default, override via env)
+set -euo pipefail
+HOST="${1:-lunova}"; VER="${DOCKER_VERSION:-27.5.1}"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+scp -q "$HERE/server/lunova-site" "$HOST:/tmp/lunova-site.new"
+ssh "$HOST" "VER='$VER' bash -s" <<'REMOTE'
+set -euo pipefail
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends uidmap slirp4netns dbus-user-session curl ca-certificates
+grep -q '^deploy:' /etc/subuid && grep -q '^deploy:' /etc/subgid || { echo 'deploy has no subuid/subgid range' >&2; exit 1; }
+sudo install -m 755 -o root -g root /tmp/lunova-site.new /usr/local/bin/lunova-site && rm -f /tmp/lunova-site.new
+D=/home/deploy
+sudo -u deploy VER="$VER" bash -s <<'AS_DEPLOY'
+set -euo pipefail
+mkdir -p ~/bin; t=$(mktemp -d); cd "$t"
+if ! { [ -x ~/bin/dockerd ] && ~/bin/dockerd --version | grep -q "$VER"; }; then
+  for f in "docker-$VER.tgz" "docker-rootless-extras-$VER.tgz"; do
+    curl -fsSLO "https://download.docker.com/linux/static/stable/$(uname -m)/$f"; tar xzf "$f" --strip-components=1 -C ~/bin
+  done
+fi
+cd /; rm -rf "$t"
+AS_DEPLOY
+sudo tee /etc/apparmor.d/home.deploy.bin.rootlesskit >/dev/null <<PROFILE
+abi <abi/4.0>,
+include <tunables/global>
+
+"$D/bin/rootlesskit" flags=(unconfined) {
+  userns,
+  include if exists <local/home.deploy.bin.rootlesskit>
+}
+PROFILE
+sudo systemctl reload apparmor || sudo systemctl restart apparmor
+sudo -u deploy mkdir -p "$D/.config/systemd/user"
+sudo -u deploy tee "$D/.config/systemd/user/docker.service" >/dev/null <<UNIT
+[Unit]
+Description=Docker (rootless, for Lunova docker sites)
+After=network.target
+
+[Service]
+Environment=PATH=$D/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/bin:/bin
+ExecStart=$D/bin/dockerd-rootless.sh
+ExecReload=/bin/kill -s HUP \$MAINPID
+TimeoutSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+Delegate=yes
+Type=notify
+NotifyAccess=all
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
+UNIT
+U=$(id -u deploy)
+sudo loginctl enable-linger deploy
+sudo -u deploy env XDG_RUNTIME_DIR=/run/user/$U systemctl --user daemon-reload
+sudo -u deploy env XDG_RUNTIME_DIR=/run/user/$U systemctl --user enable --now docker
+sleep 5
+sudo -u deploy env XDG_RUNTIME_DIR=/run/user/$U DOCKER_HOST=unix:///run/user/$U/docker.sock "$D/bin/docker" info --format 'rootless daemon {{.ServerVersion}} security={{.SecurityOptions}}'
+free -m | sed -n 1,2p
+REMOTE
+echo "rootless Docker enabled for deploy. Verify: ssh $HOST 'sudo -u deploy /usr/local/bin/lunova-site capabilities | grep docker_rootless'"

@@ -5,7 +5,7 @@ Lives at the repo root. Read by the shared workflow with `yq`. Unknown keys are 
 | key | required | meaning |
 |---|---|---|
 | `site` | yes | Unique site id: lowercase letters/digits/hyphens, 2-41 chars, starts with a letter. Reserved: default, caddy, registry, lunova, admin, root, deploy, ops. A site is bound to the first repo AND branch that registers it. |
-| `type` | yes | `static`, `spa`, `node`, `python`, `laravel`, `service` |
+| `type` | yes | `static`, `spa`, `node`, `python`, `laravel`, `docker`, `service` |
 | `domains` | yes (not for `service`) | List of hostnames. Each needs a DNS A record to the server IP before TLS can be issued. A domain can belong to one site only. |
 | `root` | static/spa | Folder to serve inside the release (e.g. `dist`). Default: release root. |
 | `start` | node/python | Command that listens on `127.0.0.1:$PORT`. No `'`, `%` or newlines. Example: `node server.js`, `.venv/bin/gunicorn app:app -b 127.0.0.1:$PORT`. |
@@ -19,6 +19,7 @@ Lives at the repo root. Read by the shared workflow with `yq`. Unknown keys are 
 | `packages` | no | Extra apt packages the project needs (e.g. `ffmpeg`). PHP extensions (from `composer.lock`) and the database engine/driver are installed automatically, so most projects list nothing. System, security, container and web-server packages are refused. |
 | `queue` | no | Laravel only. `true` = a queue worker (`queue:work`) runs as a service for the site and is restarted on each release. Use with `QUEUE_CONNECTION=database`. |
 | `scheduler` | no | Laravel only. `true` = `php artisan schedule:run` runs every minute (systemd timer). |
+| `container_port` / `dockerfile` / `context` | docker | `container_port` (required): port the app listens on inside the container. `dockerfile` (default `Dockerfile`) and `context` (default `.`) select what CI builds. `env`, `volumes`, `memory_mb` work as for `service`. `database:` is refused. See stacks.md. |
 | `image` | service | Exact `<name>:<tag>` (never `latest`). Must be on the server's allow-list (`/etc/lunova/containers.json`), otherwise the deploy is refused. |
 | `container_port` / `host_port` | service | Port inside the container / port on the server. The container is published on `127.0.0.1:<host_port>` ONLY, so only things on the server (the hub) reach it. `host_port` is picked automatically when omitted. |
 | `env` | service | Fixed non-secret environment, `KEY: value`. Secrets go in `.lunova/env.sealed` like any site. |

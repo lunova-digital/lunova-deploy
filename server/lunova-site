@@ -18,7 +18,7 @@ UNITS = Path.home() / ".config/systemd/user"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
 HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-TYPES = ("static", "spa", "node", "python", "laravel", "service")
+TYPES = ("static", "spa", "node", "python", "laravel", "service", "docker")
 CONTAINER = "/usr/local/sbin/lunova-container"
 RESERVED = {"default", "caddy", "registry", "lunova", "admin", "root", "deploy", "ops"}
 KEEP = 3
@@ -101,6 +101,112 @@ def container(*args, check=True):
     return run(["sudo", "-n", CONTAINER, *args], check=check)
 
 
+# --- type: docker (a public site whose app is a container built in CI from the project's own Dockerfile) -----------------
+# Runs in ROOTLESS Docker owned by `deploy` (never the root daemon used by `service`): a container escape is `deploy`, not root.
+DOCKER_SOCK = f"/run/user/{os.getuid()}/docker.sock"
+VOLUME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}:/[A-Za-z0-9._/-]{0,200}$")
+
+
+DOCKER_BIN = shutil.which("docker") or str(Path.home() / "bin/docker")  # rootless install puts the CLI in ~deploy/bin
+
+
+def docker_ready(): return os.access(DOCKER_BIN, os.X_OK) and os.path.exists(DOCKER_SOCK)
+
+
+def dk(*args, check=True, env=None):
+    """docker CLI against deploy's rootless daemon."""
+    e = {**os.environ, "DOCKER_HOST": f"unix://{DOCKER_SOCK}", **(env or {})}
+    return run([DOCKER_BIN, *args], check=check, env=e)
+
+
+def cname(site): return f"lunova-{site}"
+
+
+def itag(site, rid): return f"lunova-{site}:{rid}"
+
+
+def unquote_env(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1), v[1:-1])
+    return v
+
+
+def docker_env(site, d):
+    """PORT default < manifest env < sealed env (+ nothing else). Passed via the process environment, never written to disk or argv."""
+    out = {"PORT": str(d["container_port"]), **(d.get("env") or {})}
+    f = SITES / site / "shared" / ".env"
+    if f.exists():
+        for k, v in parse_env(f.read_text()).items(): out[k] = unquote_env(v)
+    return out
+
+
+def docker_load(site, rel, rid):
+    """Load the CI-built image. The archive may only contain exactly lunova-<site>:<release>, so it cannot overwrite anything else."""
+    tar = rel / "image.tar.gz"
+    if not tar.exists(): die(f"release {rid} has no image.tar.gz (the CI image build/upload did not happen)")
+    p = dk("load", "-i", str(tar))
+    loaded = [l.split(": ", 1)[1].strip() for l in p.stdout.splitlines() if l.startswith("Loaded image: ")]
+    if loaded != [itag(site, rid)] or "Loaded image ID" in p.stdout:
+        for t in loaded: dk("rmi", t, check=False)
+        die(f"image archive must contain exactly {itag(site, rid)} (found: {', '.join(loaded) or 'untagged image'})")
+
+
+def docker_up(site, d, rid):
+    """(Re)create the site's container from the release's image (loads it again from the release's archive if the image is gone)."""
+    rel = SITES / site / "releases" / rid
+    if dk("image", "inspect", itag(site, rid), check=False).returncode != 0: docker_load(site, rel, rid)
+    dk("rm", "-f", cname(site), check=False)
+    env = docker_env(site, d)
+    args = ["run", "-d", "--name", cname(site), "--restart", "unless-stopped", "--label", f"lunova.site={site}", "--label", f"lunova.release={rid}",
+            "-p", f"127.0.0.1:{d['port']}:{d['container_port']}", "--memory", f"{int(d.get('memory_mb') or 512)}m",
+            "--pids-limit", "512", "--security-opt", "no-new-privileges"]
+    for v in d.get("volumes") or []:
+        name, _, path = v.partition(":"); args += ["-v", f"lunova-{site}-{name}:{path}"]
+    for k in env: args += ["-e", k]
+    args.append(itag(site, rid))
+    p = dk(*args, check=False, env=env)
+    if p.returncode != 0: say((p.stdout + p.stderr)[-1500:]); return False
+    return True
+
+
+def prune_images(site):
+    keep = {itag(site, r.name) for r in releases(site)}
+    for t in dk("images", "--format", "{{.Repository}}:{{.Tag}}", f"lunova-{site}", check=False).stdout.split():
+        if t not in keep: dk("rmi", t, check=False)
+
+
+def release_docker(a, d, rel):
+    """Load the CI-built image, swap the container, health-check, switch; any failure puts the previous container back."""
+    if not docker_ready(): die("rootless Docker is not enabled on this server: ops request #7 (run ops/setup-docker-rootless)")
+    build_env(a.site)
+    docker_load(a.site, rel, a.id)
+    prev = current_target(a.site)
+    had = dk("inspect", cname(a.site), check=False).returncode == 0
+    if had: dk("stop", "-t", "20", cname(a.site), check=False); dk("rename", cname(a.site), cname(a.site) + "-prev")
+
+    def restore():
+        dk("rm", "-f", cname(a.site), check=False)
+        if had: dk("rename", cname(a.site) + "-prev", cname(a.site), check=False); dk("start", cname(a.site), check=False); say("previous container restored")
+    if not docker_up(a.site, d, a.id):
+        restore(); result(ok=False, site=a.site, release=a.id, error="container did not start", rolled_back=had); sys.exit(3)
+    code, url = health(a.site, d)
+    if not (isinstance(code, int) and 200 <= code < 400):
+        say(f"health check failed ({code}) at {url}")
+        say(dk("logs", "--tail", "40", cname(a.site), check=False).stdout)
+        restore(); result(ok=False, site=a.site, release=a.id, health=str(code), rolled_back=had); sys.exit(3)
+    switch(a.site, rel)
+    dk("rm", "-f", cname(a.site) + "-prev", check=False)
+    (rel / ".lunova-ok").write_text(str(int(time.time())))
+    good = sorted((r for r in releases(a.site) if ok_ts(r)), key=ok_ts)
+    keep = {str(r) for r in good[-KEEP:]} | {current_target(a.site)}
+    for old in releases(a.site):
+        if str(old) not in keep: shutil.rmtree(old, ignore_errors=True)
+    prune_images(a.site)
+    say(f"released {a.site} {a.id} (health {code}) -> container on 127.0.0.1:{d['port']}")
+    result(ok=True, site=a.site, release=a.id, health=code, domains=d["domains"])
+
+
 def service_spec(d):
     """What the container needs to run, kept inside each release so a rollback restarts exactly that release's configuration."""
     return {k: d.get(k) for k in ("image", "container_port", "host_port", "env", "volumes", "memory_mb")}
@@ -136,7 +242,7 @@ def render_caddy(site, d):
         body = f"\troot * {cur}/{d.get('root', '').strip('/')}".rstrip("/") + "\n\tencode zstd gzip\n"
         if t == "spa": body += "\ttry_files {path} /index.html\n"
         body += "\tfile_server\n"
-    elif t in ("node", "python"):
+    elif t in ("node", "python", "docker"):
         body = f"\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{d['port']}\n"
     else:  # laravel
         body = (f"\troot * {cur}/public\n\tencode zstd gzip\n\tphp_fastcgi unix/{php_socket(php_ver(d))} {{\n"
@@ -299,6 +405,7 @@ def cmd_capabilities(a):
         "php_default": PHP_DEFAULT,
         "php_fpm_socket": php_socket() if os.path.exists(php_socket()) else None,
         "mysql_client": bool(shutil.which("mysql")), "postgres_client": bool(shutil.which("psql")),
+        "docker_rootless": docker_ready(),
         "containers": bool(shutil.which("docker")) and os.path.exists("/etc/lunova/containers.json"),
         "container_images": (json.loads(Path("/etc/lunova/containers.json").read_text()).get("allowed_images", []) if os.path.exists("/etc/lunova/containers.json") else []),
         "disk_free_gb": round(shutil.disk_usage("/srv").free / 1e9, 1),
@@ -373,6 +480,21 @@ def cmd_register(a):
         used = {x.get("port") for s, x in sites.items() if s != a.site}
         d["port"] = (old or {}).get("port") or next((p for p in PORTS if p not in used and p not in listening_ports()), None)
         if not d["port"]: die("no free port available")
+    if a.type == "docker":
+        if not docker_ready(): die("rootless Docker is not enabled on this server. That is an ops request: run ops/setup-docker-rootless (see skills/lunova-deploy/references/ops-requests.md #7)")
+        if a.database: die("`database:` is not supported for docker sites (the container cannot reach the server's database). Point the app at its own database with sealed env.")
+        if not a.container_port or not 1 <= a.container_port <= 65535: die("--container-port is required for a docker site (the port the app listens on inside the container)")
+        env = {}
+        for kv in a.env or []:
+            k, _, v = kv.partition("=")
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", k): die(f"invalid env name '{k}'")
+            env[k] = v
+        vols = a.volume or []
+        if len(vols) > 4 or not all(VOLUME_RE.match(v) for v in vols): die("volumes: at most 4, each `name:/absolute/path` (named volumes only; host paths are never mounted)")
+        used = {x.get("port") for s, x in sites.items() if s != a.site} | {x.get("host_port") for s, x in sites.items() if s != a.site}
+        d["port"] = (old or {}).get("port") or next((p for p in PORTS if p not in used and p not in listening_ports()), None)
+        if not d["port"]: die("no free port available")
+        d.update({"container_port": a.container_port, "env": env, "volumes": vols, "memory_mb": max(64, min(a.memory, 1024))})
     if a.type == "service":
         if not shutil.which("docker") or not os.path.exists("/etc/lunova/containers.json"):
             die("containers are not enabled on this server. That is an ops request: run ops/setup-containers (see skills/lunova-deploy/references/ops-requests.md #6)")
@@ -439,6 +561,9 @@ def restart(site, d):
     if d["type"] == "service":
         cur = current_target(site)
         if cur: container("up", site, os.path.basename(cur))
+    if d["type"] == "docker":
+        cur = current_target(site)
+        if cur and not docker_up(site, d, os.path.basename(cur)): die("container did not start")
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "restart", f"site-{site}.service"])
     if d["type"] == "laravel":
@@ -448,7 +573,7 @@ def restart(site, d):
 
 def health(site, d):
     path = d.get("health_path") or "/"
-    if d["type"] in ("node", "python"): url, hdr = f"http://127.0.0.1:{d['port']}{path}", {}
+    if d["type"] in ("node", "python", "docker"): url, hdr = f"http://127.0.0.1:{d['port']}{path}", {}
     elif d["type"] == "service": url, hdr = f"http://127.0.0.1:{d['host_port']}{path}", {}
     else: url, hdr = f"http://127.0.0.1{path}", {"Host": d["domains"][0]}
 
@@ -499,6 +624,7 @@ def cmd_release(a):
     rel = SITES / a.site / "releases" / a.id
     if not rel.is_dir(): die(f"release {rel} not found: upload it first")
     if d["type"] == "service": return release_service(a, d, rel)
+    if d["type"] == "docker": return release_docker(a, d, rel)
     env = SITES / a.site / "shared" / ".env"
     ensure_runtime(a.site, d, rel)
     seed_env(a.site, d, rel)
@@ -558,6 +684,9 @@ def cmd_status(a):
         active = run(["systemctl", "--user", "is-active", f"site-{a.site}.service"], check=False).stdout.strip()
     code, url = health(a.site, d) if cur else (None, None)
     extra = {}
+    if d["type"] == "docker" and docker_ready():
+        st = dk("inspect", "-f", "{{.State.Status}} restarts={{.RestartCount}} release={{index .Config.Labels \"lunova.release\"}}", cname(a.site), check=False)
+        active = st.stdout.strip() or "no container"
     if d["type"] == "service":
         st = container("status", a.site, check=False); active = st.stdout.strip() or st.stderr.strip()
     if d["type"] == "laravel":
@@ -632,6 +761,8 @@ def cmd_logs(a):
     logs = sorted((SITES / a.site / "shared" / "storage" / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime) if d["type"] == "laravel" else []
     if logs:
         say(f"-- {logs[-1].name}"); say(run(["tail", "-n", str(n), str(logs[-1])]).stdout)
+    if d["type"] == "docker" and docker_ready():
+        p = dk("logs", "--tail", str(n), cname(a.site), check=False); say((p.stdout + p.stderr).strip() or "(no container logs)")
     if d["type"] == "service":
         say(container("logs", a.site, str(n), check=False).stdout.strip() or "(no container logs)")
     for unit in (f"site-{a.site}.service", f"site-{a.site}-queue.service", f"site-{a.site}-schedule.service"):
@@ -653,6 +784,10 @@ def cmd_unregister(a):
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "disable", "--now", f"site-{a.site}.service"], check=False)
         (UNITS / f"site-{a.site}.service").unlink(missing_ok=True); run(["systemctl", "--user", "daemon-reload"])
+    if d["type"] == "docker" and docker_ready():
+        dk("rm", "-f", cname(a.site), cname(a.site) + "-prev", check=False)
+        for t in dk("images", "--format", "{{.Repository}}:{{.Tag}}", f"lunova-{a.site}", check=False).stdout.split(): dk("rmi", t, check=False)
+        say("container and images removed (named data volumes are kept)")
     if d["type"] == "service":
         container("down", a.site, check=False); reg_path(a.site).unlink(); say(f"unregistered {a.site} (its data volumes are kept)"); result(ok=True, site=a.site); return
     d2 = {**d, "queue": False, "scheduler": False}; sync_workers(a.site, d2)

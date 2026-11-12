@@ -8,6 +8,7 @@ skills/lunova-deploy/   Claude Code skill (what developers use)
 server/lunova-site      server helper: register / release / rollback / status (installed at /usr/local/bin)
 server/lunova-container root helper that runs an allow-listed container for `type: service` sites (installed at /usr/local/sbin)
 ops/setup-containers    one-time ops script: Docker + the helper + the image allow-list
+ops/setup-docker-rootless  one-time ops script: rootless Docker for `deploy` (type: docker sites) + installs lunova-site
 tests/                  offline tests: python3 -m unittest discover -s tests
 ```
 
@@ -27,6 +28,9 @@ You need: `gh` logged in with access to your repo, push rights. You do NOT need 
 - **Sealed env**: `scripts/lunova-seal` encrypts values with the server's public key (`skills/lunova-deploy/seal.pub.pem`; the private key is `/var/lib/lunova/seal/private.pem`, owner deploy, mode 600). The sealed file is committed in the project.
 - **Release retention**: after each healthy deploy `lunova-site release` keeps only the last 3 healthy releases (`KEEP = 3`, always including `current`) and deletes the rest, including failed ones.
 - Server tools: `server/lunova-site`, `lunova-gate`, `lunova-authkeys` -> `/usr/local/bin`; `lunova-provision`, `lunova-db` -> `/usr/local/sbin`. Reinstall after editing with `scp` + `sudo install -m 755 -o root -g root`. Tag `v2` after workflow changes are merged.
+
+## Dockerfile sites (v8: `type: docker`)
+A normal public site (domain, TLS via Caddy) whose app is a container built from the project's own Dockerfile. The image is built **in CI**, shipped as `image.tar.gz` through the existing gate/rsync path (no gate change), loaded on the server and run in a **rootless** Docker daemon owned by `deploy` (`ops/setup-docker-rootless`; a container escape is `deploy`, not root, and this is separate from the root daemon of `type: service`). Caddy reverse-proxies the domain to `127.0.0.1:<auto port>`. Manifest: `container_port` (required), `dockerfile`, `context`, `env`, `volumes` (named only), `memory_mb`. Archive must contain exactly `lunova-<site>:<release>`; container runs with `no-new-privileges`, a memory limit and pids limit; env/secrets are passed via the process environment, never argv or disk. Failed start/health check restores the previous container. `database:` is refused. Offline tests: `tests/test_docker.py`. **Not yet run against a real rootless daemon** until `ops/setup-docker-rootless` has been run.
 
 ## Internal services (v8: `type: service`)
 A site can be an **internal container** instead of a web site: no domain, no certificate, no Caddy entry. It is published on `127.0.0.1:<host_port>` only, so only things on the same server (the hub) can call it. First user: the Signal gateway (`lunova-digital/lunova-signal-gateway`).

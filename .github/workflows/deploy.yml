@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v8: v7 + `type: service`, an internal allow-listed container with no domain (e.g. the Signal gateway); v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
+# Reusable Lunova deploy workflow (v8: v7 + `type: docker`, a public site built from the project Dockerfile in CI and run in rootless Docker, plus `type: service`, an internal allow-listed container with no domain (e.g. the Signal gateway); v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
 # self-hosted runner instances sharing one gh-runner user don't race on each other's key/known_hosts).
 # Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
@@ -178,7 +178,7 @@ jobs:
             case "$TYPE" in
               laravel) cmds=("composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction") ;;
               node|spa|static) cmds=("[ ! -f package.json ] || npm ci" "[ ! -f package.json ] || npm run build --if-present") ;;
-              python|service) cmds=() ;;
+              python|service|docker) cmds=() ;;
             esac
           else
             mapfile -t cmds < <(yq -r '.build[]' "$MANIFEST")
@@ -195,6 +195,13 @@ jobs:
             # an internal container: image, ports, fixed (non-secret) env and named data volumes. Secrets go in .lunova/env.sealed.
             args+=(--image "$(yq -r '.image // ""' "$MANIFEST")" --container-port "$(yq -r '.container_port // ""' "$MANIFEST")")
             hp=$(yq -r '.host_port // ""' "$MANIFEST"); [ -n "$hp" ] && args+=(--host-port "$hp")
+            mem=$(yq -r '.memory_mb // ""' "$MANIFEST"); [ -n "$mem" ] && args+=(--memory "$mem")
+            while IFS= read -r kv; do [ -n "$kv" ] && args+=(--env "$kv"); done < <(yq -r '.env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "$MANIFEST")
+            while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done < <(yq -r '.volumes // [] | .[]' "$MANIFEST")
+          fi
+          if [ "$TYPE" = "docker" ]; then
+            # a public site whose app is a container built from the project's Dockerfile (in CI, below). Secrets go in .lunova/env.sealed.
+            args+=(--container-port "$(yq -r '.container_port // ""' "$MANIFEST")")
             mem=$(yq -r '.memory_mb // ""' "$MANIFEST"); [ -n "$mem" ] && args+=(--memory "$mem")
             while IFS= read -r kv; do [ -n "$kv" ] && args+=(--env "$kv"); done < <(yq -r '.env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "$MANIFEST")
             while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done < <(yq -r '.volumes // [] | .[]' "$MANIFEST")
@@ -227,12 +234,31 @@ jobs:
             echo "No .lunova/env.sealed: the server builds .env from .env.example, its own defaults and generated database credentials."
           fi
 
+      - name: "Build container image (type docker, built here in CI and shipped to the server as a release archive)"
+        if: env.MODE == 'deploy' && env.TYPE == 'docker'
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null || { echo "::error::docker is not available on this runner (type: docker builds the image in CI)."; exit 1; }
+          ID="${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}"
+          DF=$(yq -r '.dockerfile // "Dockerfile"' "$MANIFEST"); CTX=$(yq -r '.context // "."' "$MANIFEST")
+          [ -f "$DF" ] || { echo "::error::Dockerfile '$DF' not found (set dockerfile: in .lunova.yml)"; exit 1; }
+          docker build -t "lunova-$SITE:$ID" -f "$DF" "$CTX"
+          OUT="$RUNNER_TEMP/lunova-image-$GITHUB_RUN_ID"; rm -rf "$OUT"; mkdir -p "$OUT"
+          docker save "lunova-$SITE:$ID" | gzip -1 > "$OUT/image.tar.gz"
+          echo "IMAGE_DIR=$OUT" >> "$GITHUB_ENV"
+          ls -lh "$OUT/image.tar.gz"
+
       - name: Upload release
         if: env.MODE == 'deploy'
         run: |
           set -euo pipefail
           ID="${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}"
           echo "RELEASE_ID=$ID" >> "$GITHUB_ENV"
+          if [ "$TYPE" = "docker" ]; then   # only the image archive goes to the server, never the source tree
+            rsync -a --delete --mkpath -e "ssh -F $LUNOVA_DIR/ssh/config -o BatchMode=yes" --rsync-path "LUNOVA_TOKEN=$($LUNOVA_DIR/token) rsync" \
+              "$IMAGE_DIR/" "lunova:/srv/sites/$SITE/releases/$ID/"
+            exit 0
+          fi
           # .env.example is uploaded (the server seeds the app's .env from it); real env files and Lunova files are not
           ex=(--include '.env.example' --exclude .git --exclude .github --exclude '.env' --exclude '.env.*' --exclude .lunova --exclude .lunova.yml)
           [ "$KEEP_NODE_MODULES" = "true" ] || ex+=(--exclude node_modules)
