@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""lunova-container: run ONE allow-listed container for a `service` site. Root-owned, installed at /usr/local/sbin.
+
+`deploy` may run only `sudo lunova-container <up|down|status|logs> <site> ...`, in practice only lunova-site calls it. Docker access is root
+equivalent, so this helper never trusts the spec (the release's .lunova-service.json is written by the less-trusted deploy user) and
+re-validates all of it against /etc/lunova/containers.json, which only root can edit:
+
+  {"allowed_images": ["bbernhard/signal-cli-rest-api"], "max_memory_mb": 1024, "min_host_port": 1024}
+
+What a service container can never be: a non-allow-listed image, an untagged/`latest` image, privileged, on the host network, bound to a
+public address, mounted to a host path, or given extra capabilities beyond the small fixed set below.
+"""
+import hashlib, json, os, re, subprocess, sys
+from pathlib import Path
+
+CONFIG = Path("/etc/lunova/containers.json")
+SITES = Path("/srv/sites"); REG = Path("/srv/registry/sites")
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
+ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+IMAGE_RE = re.compile(r"^([a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*){0,3}):([A-Za-z0-9][A-Za-z0-9._-]{0,63})$")
+ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+VOL_RE = re.compile(r"^([a-z][a-z0-9-]{0,30}):(/[A-Za-z0-9._/-]{1,120})$")
+FORBIDDEN_MOUNT = re.compile(r"^/(proc|sys|dev|run|var/run)(/|$)|\.\.")
+# the smallest set a typical image entrypoint needs to fix ownership of its data dir and drop to its own user
+CAPS = ("CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER")
+
+
+def die(m, code=1): print(f"ERROR: {m}", file=sys.stderr); sys.exit(code)
+
+
+def cfg():
+    try: return json.loads(CONFIG.read_text())
+    except (OSError, ValueError): die(f"{CONFIG} is missing or invalid: ops must run ops/setup-containers first")
+
+
+def docker(*args, check=True):
+    p = subprocess.run(["docker", *args], text=True, capture_output=True)
+    if check and p.returncode != 0: die(f"docker {args[0]} failed:\n{(p.stdout + p.stderr)[-1500:]}")
+    return p
+
+
+def validate(site, spec, c=None):
+    """Return the normalized spec or die. Pure apart from reading the config (tested without Docker)."""
+    c = c if c is not None else cfg()
+    m = IMAGE_RE.match(str(spec.get("image", "")))
+    if not m: die("image must be <name>:<tag>")
+    repo, tag = m.groups()
+    if tag in ("latest", "stable", "main", "master"): die("pin an exact image version (not a moving tag)")
+    if repo not in c.get("allowed_images", []): die(f"image '{repo}' is not allowed on this server (ops: add it to allowed_images in {CONFIG})")
+    try: cport, hport = int(spec["container_port"]), int(spec["host_port"])
+    except (KeyError, TypeError, ValueError): die("container_port and host_port are required numbers")
+    if not 1 <= cport <= 65535: die("bad container_port")
+    if not c.get("min_host_port", 1024) <= hport <= 65535: die("bad host_port")
+    mem = int(spec.get("memory_mb") or 512)
+    if not 64 <= mem <= int(c.get("max_memory_mb", 1024)): die(f"memory_mb must be between 64 and {c.get('max_memory_mb', 1024)}")
+    env = spec.get("env") or {}
+    if not isinstance(env, dict) or len(env) > 40: die("env must be a small map")
+    for k, v in env.items():
+        if not ENV_KEY_RE.match(k) or not isinstance(v, str) or len(v) > 500 or re.search(r"[\r\n\0]", v): die(f"bad env entry '{k}'")
+    vols = []
+    for v in spec.get("volumes") or []:
+        mm = VOL_RE.match(str(v))
+        if not mm or FORBIDDEN_MOUNT.search(mm.group(2)): die(f"bad volume '{v}' (use name:/absolute/path)")
+        vols.append((mm.group(1), mm.group(2)))
+    if len(vols) > 4: die("at most 4 volumes")
+    return {"image": f"{repo}:{tag}", "container_port": cport, "host_port": hport, "memory_mb": mem, "env": dict(sorted(env.items())), "volumes": vols}
+
+
+def unquote(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1), v[1:-1])
+    return v
+
+
+def shared_env(site):
+    """Sealed values from /srv/sites/<site>/shared/.env as a plain dict (Docker's env-file does not unquote)."""
+    f = SITES / site / "shared" / ".env"; out = {}
+    if f.exists():
+        for line in f.read_text().splitlines():
+            m = re.match(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*)$", line)
+            if m: out[m.group(1)] = unquote(m.group(2))
+    return out
+
+
+def load(site, release=None):
+    if not NAME_RE.match(site or ""): die("invalid site")
+    try: reg = json.loads((REG / f"{site}.json").read_text())
+    except (OSError, ValueError): die(f"site '{site}' is not registered")
+    if reg.get("type") != "service": die(f"site '{site}' is not a service")
+    if release is None: return reg, None
+    if not ID_RE.match(release): die("invalid release id")
+    sf = SITES / site / "releases" / release / ".lunova-service.json"
+    try: spec = json.loads(sf.read_text())
+    except (OSError, ValueError): die(f"release {release} has no service spec")
+    return reg, validate(site, spec)
+
+
+def name(site): return f"lunova-{site}"
+
+
+def port_in_use_by_other(site, port):
+    out = subprocess.run(["ss", "-ltnH"], text=True, capture_output=True).stdout
+    if not re.search(rf":{port}\s", out): return False
+    p = docker("port", name(site), check=False)
+    return f":{port}" not in p.stdout  # listening, and not our own container
+
+
+def cmd_up(site, release):
+    reg, spec = load(site, release)
+    env = {**shared_env(site), **spec["env"]}  # sealed values first, the manifest's fixed env wins nothing secret
+    want = hashlib.sha256(json.dumps({"s": spec, "e": env}, sort_keys=True).encode()).hexdigest()[:32]
+    cur = docker("inspect", "-f", '{{index .Config.Labels "lunova.spec"}} {{.State.Running}}', name(site), check=False)
+    if cur.returncode == 0 and cur.stdout.split() == [want, "true"]:
+        print(f"unchanged: {name(site)} already runs this release's configuration"); return
+    if port_in_use_by_other(site, spec["host_port"]): die(f"port {spec['host_port']} is already in use on this server")
+    print(f"pulling {spec['image']}")
+    docker("pull", "--quiet", spec["image"])
+    envfile = None
+    if env:
+        d = Path("/run/lunova-container"); d.mkdir(mode=0o700, exist_ok=True)
+        envfile = d / f"{site}.env"; fd = os.open(envfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: f.write("".join(f"{k}={v}\n" for k, v in env.items() if "\n" not in v))
+    docker("rm", "-f", name(site), check=False)
+    args = ["run", "-d", "--name", name(site), "--restart", "unless-stopped", "--init",
+            "--label", f"lunova.site={site}", "--label", f"lunova.release={release}", "--label", f"lunova.spec={want}",
+            "--cap-drop", "ALL", *sum((["--cap-add", c] for c in CAPS), []), "--security-opt", "no-new-privileges",
+            "--pids-limit", "256", "--memory", f"{spec['memory_mb']}m", "--memory-swap", f"{spec['memory_mb']}m", "--cpus", "1",
+            "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+            "-p", f"127.0.0.1:{spec['host_port']}:{spec['container_port']}"]
+    if envfile: args += ["--env-file", str(envfile)]
+    for vname, path in spec["volumes"]: args += ["-v", f"lunova-{site}-{vname}:{path}"]
+    args.append(spec["image"])
+    p = docker(*args, check=False)
+    if envfile: envfile.unlink(missing_ok=True)
+    if p.returncode != 0: die(f"could not start the container:\n{(p.stdout + p.stderr)[-1500:]}")
+    print(f"started {name(site)} (release {release}) on 127.0.0.1:{spec['host_port']}")
+
+
+def cmd_down(site):
+    load(site); docker("rm", "-f", name(site), check=False); print(f"removed {name(site)} (its volumes are kept)")
+
+
+def cmd_status(site):
+    load(site)
+    p = docker("inspect", "-f", "{{.State.Status}} restarts={{.RestartCount}} image={{.Config.Image}} release={{index .Config.Labels \"lunova.release\"}}", name(site), check=False)
+    print(p.stdout.strip() if p.returncode == 0 else "not running (no container)")
+
+
+def cmd_logs(site, n):
+    load(site); n = max(1, min(int(n), 500))
+    p = docker("logs", "--tail", str(n), name(site), check=False); print((p.stdout + p.stderr).strip() or "(no log lines)")
+
+
+def main():
+    a = sys.argv[1:]
+    if len(a) < 2: die("usage: lunova-container up <site> <release> | down <site> | status <site> | logs <site> [lines]")
+    cmd, site = a[0], a[1]
+    if cmd == "up" and len(a) == 3: cmd_up(site, a[2])
+    elif cmd == "down" and len(a) == 2: cmd_down(site)
+    elif cmd == "status" and len(a) == 2: cmd_status(site)
+    elif cmd == "logs" and len(a) in (2, 3): cmd_logs(site, a[2] if len(a) == 3 else 80)
+    else: die("bad arguments")
+
+
+if __name__ == "__main__":
+    main()

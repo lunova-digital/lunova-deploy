@@ -6,6 +6,9 @@ Private tooling so a Lunova developer can deploy any project to the Lunova serve
 skills/lunova-deploy/   Claude Code skill (what developers use)
 `.github/workflows/deploy.yml`  shared reusable workflow (called by developer repos, tagged v1)
 server/lunova-site      server helper: register / release / rollback / status (installed at /usr/local/bin)
+server/lunova-container root helper that runs an allow-listed container for `type: service` sites (installed at /usr/local/sbin)
+ops/setup-containers    one-time ops script: Docker + the helper + the image allow-list
+tests/                  offline tests: python3 -m unittest discover -s tests
 ```
 
 ## For developers: install the skill
@@ -25,12 +28,21 @@ You need: `gh` logged in with access to your repo, push rights. You do NOT need 
 - **Release retention**: after each healthy deploy `lunova-site release` keeps only the last 3 healthy releases (`KEEP = 3`, always including `current`) and deletes the rest, including failed ones.
 - Server tools: `server/lunova-site`, `lunova-gate`, `lunova-authkeys` -> `/usr/local/bin`; `lunova-provision`, `lunova-db` -> `/usr/local/sbin`. Reinstall after editing with `scp` + `sudo install -m 755 -o root -g root`. Tag `v2` after workflow changes are merged.
 
+## Internal services (v8: `type: service`)
+A site can be an **internal container** instead of a web site: no domain, no certificate, no Caddy entry. It is published on `127.0.0.1:<host_port>` only, so only things on the same server (the hub) can call it. First user: the Signal gateway (`lunova-digital/lunova-signal-gateway`).
+- Manifest keys: `image` (exact tag, never `latest`), `container_port`, `host_port`, `env`, `volumes`, `memory_mb`, `health_path`. See `skills/lunova-deploy/references/manifest.md`.
+- **Docker is root-equivalent, so `deploy` never gets it.** `lunova-site` calls `sudo lunova-container up|down|status|logs <site>`, a root helper that re-validates everything against `/etc/lunova/containers.json` (editable by root only): image must be on the allow-list and pinned; ports are loopback-only; memory capped; no host mounts (named volumes only); fixed small capability set; no privileged mode, no host network.
+- A release is the container configuration (`.lunova-service.json` inside the release). Deploy = start, health-check, switch; any failure restarts the previous configuration. An unchanged configuration never restarts the container (a README-only push is harmless). Rollback and `status`/`logs` work as for other sites. `unregister` stops the container and keeps its data volumes.
+- Enable once: `ops/setup-containers [host] [image...]`. To allow another image, ops add it to `allowed_images`.
+- Secrets for a service travel as sealed env like any site; they are written to a root-only temp env-file for `docker run` and removed.
+
 ## Known limits
 - Anyone who can push to the deploy branch of an allowed-owner repo deploys that site. Protect the branch in GitHub if that matters.
 - Owners are trusted: a `packages:` entry or a hook in a repo of an allowed owner runs on the server as that site's deploy.
 - GitHub Free: OIDC works on every plan, and a public workflow repo is what lets private repos call it.
 
 ## Test status
+- v8 service sites: `tests/` (offline): allow-list and spec validation, health on the host port, switch and mark on success, previous configuration restored on a failed start or failed health check, no domain accepted. **Not yet run against a real Docker host** and the `yq` expressions in the workflow's service branch are untested on GitHub; the first real deploy is the test (use `mode=check` first).
 - Tested live on the server (simulated verified identity): site/repo/branch binding (other repo, other branch and PR refs refused), sealed env (apply once, DB_* refused, wrong repo refused, names-only status), automatic provisioning (PHP DB driver, apt package, `openssh-server` refused), MariaDB and PostgreSQL creation with generated passwords (real TCP login), Laravel env seeding (production defaults, generated APP_KEY, `.env.example` keys), release + health check.
 - `lunova-gate` token verification unit-tested: valid token accepted; expired, wrong audience/issuer, owner not allowed, right name but wrong owner id, custom workflow, forged signature and unknown key all refused.
 - Earlier (v1 era): rollback with healthy-release markers, hook failure leaves the site untouched, auto-rollback on failed health check, queue worker and scheduler, survived a reboot.

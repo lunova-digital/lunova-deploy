@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """lunova-site: register, release, check and roll back sites on the Lunova server.
 
-Runs as the unprivileged `deploy` user. Only privileged action: sudo caddy-reload.
+Runs as the unprivileged `deploy` user. Privileged actions: sudo caddy-reload, lunova-provision, lunova-db and (service sites) lunova-container.
 Layout: /srv/sites/<site>/{releases/<id>,current,shared}, /etc/caddy/sites/<site>.caddy,
         ~/.config/systemd/user/site-<site>.service, /srv/registry/sites/<site>.json
 All output is human readable; machine-readable results are printed as a final `RESULT {json}` line.
@@ -18,7 +18,8 @@ UNITS = Path.home() / ".config/systemd/user"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
 HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-TYPES = ("static", "spa", "node", "python", "laravel")
+TYPES = ("static", "spa", "node", "python", "laravel", "service")
+CONTAINER = "/usr/local/sbin/lunova-container"
 RESERVED = {"default", "caddy", "registry", "lunova", "admin", "root", "deploy", "ops"}
 KEEP = 3
 CLOUDFLARE = [ipaddress.ip_network(n) for n in (
@@ -93,6 +94,16 @@ def listening_ports():
 
 
 def caddy_reload(): run(["sudo", "-n", "/usr/local/sbin/caddy-reload"])
+
+
+def container(*args, check=True):
+    """The root helper that runs an allow-listed container (service sites only)."""
+    return run(["sudo", "-n", CONTAINER, *args], check=check)
+
+
+def service_spec(d):
+    """What the container needs to run, kept inside each release so a rollback restarts exactly that release's configuration."""
+    return {k: d.get(k) for k in ("image", "container_port", "host_port", "env", "volumes", "memory_mb")}
 
 
 PHP_VERSIONS = ("8.3", "8.4", "8.5")
@@ -288,6 +299,8 @@ def cmd_capabilities(a):
         "php_default": PHP_DEFAULT,
         "php_fpm_socket": php_socket() if os.path.exists(php_socket()) else None,
         "mysql_client": bool(shutil.which("mysql")), "postgres_client": bool(shutil.which("psql")),
+        "containers": bool(shutil.which("docker")) and os.path.exists("/etc/lunova/containers.json"),
+        "container_images": (json.loads(Path("/etc/lunova/containers.json").read_text()).get("allowed_images", []) if os.path.exists("/etc/lunova/containers.json") else []),
         "disk_free_gb": round(shutil.disk_usage("/srv").free / 1e9, 1),
         "sites": sorted(s for s, d in all_sites().items() if not WHO or d.get("repo") == WHO), "public_ip": cfg().get("public_ip"),
     }
@@ -318,8 +331,9 @@ def cmd_check_domain(a):
 def cmd_register(a):
     check_name(a.site)
     if a.type not in TYPES: die(f"type must be one of {', '.join(TYPES)}")
-    domains = [h.lower() for h in a.domains.split(",") if h.strip()]
-    if not domains: die("at least one domain is required")
+    domains = [h.lower() for h in (a.domains or "").split(",") if h.strip()]
+    if a.type == "service" and domains: die("a service is internal: it takes no domain (only the workspace on this server reaches it, on 127.0.0.1)")
+    if a.type != "service" and not domains: die("at least one domain is required")
     for h in domains:
         if not HOST_RE.match(h): die(f"invalid domain '{h}'")
     sites = all_sites(); old = sites.get(a.site)
@@ -359,6 +373,26 @@ def cmd_register(a):
         used = {x.get("port") for s, x in sites.items() if s != a.site}
         d["port"] = (old or {}).get("port") or next((p for p in PORTS if p not in used and p not in listening_ports()), None)
         if not d["port"]: die("no free port available")
+    if a.type == "service":
+        if not shutil.which("docker") or not os.path.exists("/etc/lunova/containers.json"):
+            die("containers are not enabled on this server. That is an ops request: run ops/setup-containers (see skills/lunova-deploy/references/ops-requests.md #6)")
+        if not a.image: die("--image is required for a service (an exact <name>:<tag>)")
+        env = {}
+        for kv in a.env or []:
+            k, _, v = kv.partition("=")
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", k): die(f"invalid env name '{k}'")
+            env[k] = v
+        used = {x.get("host_port") for s, x in sites.items() if s != a.site} | {x.get("port") for s, x in sites.items() if s != a.site}
+        host_port = a.host_port or (old or {}).get("host_port") or next((p for p in PORTS if p not in used and p not in listening_ports()), None)
+        if not host_port: die("no free port available")
+        if host_port in used: die(f"port {host_port} belongs to another site")
+        d.update({"image": a.image, "container_port": a.container_port, "host_port": int(host_port), "env": env, "volumes": a.volume or [], "memory_mb": a.memory})
+        if not d["container_port"]: die("--container-port is required for a service")
+        base = SITES / a.site
+        for sub in ("releases", "shared"): (base / sub).mkdir(parents=True, exist_ok=True)
+        save(a.site, d)
+        say(f"registered {a.site} (service) on 127.0.0.1:{host_port}, image {a.image}")
+        result(ok=True, site=a.site, type="service", host_port=int(host_port), updated=bool(old)); return
     base = SITES / a.site
     for sub in ("releases", "shared"): (base / sub).mkdir(parents=True, exist_ok=True)
     CADDY.mkdir(parents=True, exist_ok=True)
@@ -402,6 +436,9 @@ def switch(site, rel):
 
 
 def restart(site, d):
+    if d["type"] == "service":
+        cur = current_target(site)
+        if cur: container("up", site, os.path.basename(cur))
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "restart", f"site-{site}.service"])
     if d["type"] == "laravel":
@@ -412,6 +449,7 @@ def restart(site, d):
 def health(site, d):
     path = d.get("health_path") or "/"
     if d["type"] in ("node", "python"): url, hdr = f"http://127.0.0.1:{d['port']}{path}", {}
+    elif d["type"] == "service": url, hdr = f"http://127.0.0.1:{d['host_port']}{path}", {}
     else: url, hdr = f"http://127.0.0.1{path}", {"Host": d["domains"][0]}
 
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -429,11 +467,38 @@ def health(site, d):
     return last, url
 
 
+def release_service(a, d, rel):
+    """A service is a container: the release is its configuration. Start it, check health, switch; on any failure put the previous one back."""
+    build_env(a.site)
+    (rel / ".lunova-service.json").write_text(json.dumps(service_spec(d), sort_keys=True))
+    prev = current_target(a.site)
+
+    def restore():
+        if prev: switch(a.site, prev); container("up", a.site, os.path.basename(prev), check=False); say(f"restored {os.path.basename(prev)}")
+    p = container("up", a.site, a.id, check=False)
+    say((p.stdout + p.stderr).strip())
+    if p.returncode != 0:
+        restore(); result(ok=False, site=a.site, release=a.id, error="container did not start", rolled_back=bool(prev)); sys.exit(3)
+    switch(a.site, rel)
+    code, url = health(a.site, d)
+    if not (isinstance(code, int) and 200 <= code < 400):
+        say(f"health check failed ({code}) at {url}"); restore()
+        result(ok=False, site=a.site, release=a.id, health=str(code), rolled_back=bool(prev)); sys.exit(3)
+    (rel / ".lunova-ok").write_text(str(int(time.time())))
+    good = sorted((r for r in releases(a.site) if ok_ts(r)), key=ok_ts)
+    keep = {str(r) for r in good[-KEEP:]} | {current_target(a.site)}
+    for old in releases(a.site):
+        if str(old) not in keep: shutil.rmtree(old, ignore_errors=True)
+    say(f"released {a.site} {a.id} (health {code}) on 127.0.0.1:{d['host_port']}")
+    result(ok=True, site=a.site, release=a.id, health=code, host_port=d["host_port"])
+
+
 def cmd_release(a):
     check_name(a.site); d = load(a.site, write=True)
     if not ID_RE.match(a.id): die("invalid release id")
     rel = SITES / a.site / "releases" / a.id
     if not rel.is_dir(): die(f"release {rel} not found: upload it first")
+    if d["type"] == "service": return release_service(a, d, rel)
     env = SITES / a.site / "shared" / ".env"
     ensure_runtime(a.site, d, rel)
     seed_env(a.site, d, rel)
@@ -493,6 +558,8 @@ def cmd_status(a):
         active = run(["systemctl", "--user", "is-active", f"site-{a.site}.service"], check=False).stdout.strip()
     code, url = health(a.site, d) if cur else (None, None)
     extra = {}
+    if d["type"] == "service":
+        st = container("status", a.site, check=False); active = st.stdout.strip() or st.stderr.strip()
     if d["type"] == "laravel":
         for unit in ("queue.service", "schedule.timer"):
             if (UNITS / f"site-{a.site}-{unit}").exists():
@@ -565,6 +632,8 @@ def cmd_logs(a):
     logs = sorted((SITES / a.site / "shared" / "storage" / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime) if d["type"] == "laravel" else []
     if logs:
         say(f"-- {logs[-1].name}"); say(run(["tail", "-n", str(n), str(logs[-1])]).stdout)
+    if d["type"] == "service":
+        say(container("logs", a.site, str(n), check=False).stdout.strip() or "(no container logs)")
     for unit in (f"site-{a.site}.service", f"site-{a.site}-queue.service", f"site-{a.site}-schedule.service"):
         if (UNITS / unit).exists():
             p = run(["journalctl", "--user", "-u", unit, "-n", str(n), "--no-pager", "-o", "short"], check=False)
@@ -584,6 +653,8 @@ def cmd_unregister(a):
     if d["type"] in ("node", "python"):
         run(["systemctl", "--user", "disable", "--now", f"site-{a.site}.service"], check=False)
         (UNITS / f"site-{a.site}.service").unlink(missing_ok=True); run(["systemctl", "--user", "daemon-reload"])
+    if d["type"] == "service":
+        container("down", a.site, check=False); reg_path(a.site).unlink(); say(f"unregistered {a.site} (its data volumes are kept)"); result(ok=True, site=a.site); return
     d2 = {**d, "queue": False, "scheduler": False}; sync_workers(a.site, d2)
     (CADDY / f"{a.site}.caddy").unlink(missing_ok=True); reg_path(a.site).unlink(); caddy_reload()
     say(f"unregistered {a.site}"); result(ok=True, site=a.site)
@@ -594,10 +665,12 @@ def main():
     sp.add_parser("capabilities").set_defaults(f=cmd_capabilities)
     c = sp.add_parser("check-domain"); c.add_argument("--site", default=""); c.add_argument("domains", nargs="+"); c.set_defaults(f=cmd_check_domain)
     r = sp.add_parser("register"); r.add_argument("--site", required=True); r.add_argument("--type", required=True)
-    r.add_argument("--domains", required=True); r.add_argument("--repo"); r.add_argument("--start"); r.add_argument("--root")
+    r.add_argument("--domains", default=""); r.add_argument("--repo"); r.add_argument("--start"); r.add_argument("--root")
     r.add_argument("--database", choices=["mysql", "postgres", "sqlite"]); r.add_argument("--package", action="append")
     r.add_argument("--php"); r.add_argument("--queue", action="store_true"); r.add_argument("--scheduler", action="store_true")
     r.add_argument("--health-path", default="/"); r.add_argument("--hook", action="append"); r.add_argument("--http-only", action="store_true")
+    r.add_argument("--image"); r.add_argument("--container-port", type=int); r.add_argument("--host-port", type=int)
+    r.add_argument("--env", action="append"); r.add_argument("--volume", action="append"); r.add_argument("--memory", type=int, default=512)
     r.set_defaults(f=cmd_register)
     x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)
     b = sp.add_parser("rollback"); b.add_argument("site"); b.add_argument("--to"); b.set_defaults(f=cmd_rollback)

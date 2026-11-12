@@ -19,3 +19,6 @@ Not an ops message: the server accepts only repos owned by `lunova-digital` or `
 
 ## 5. Anything else
 Describe what the pipeline could not do and the error text from the workflow log.
+
+## 6. Enable containers / allow an image (internal `type: service`)
+> Please run `ops/setup-containers` from the lunova-deploy repo against the Lunova server (installs Docker, the `lunova-container` helper and the sudo rule, and creates `/etc/lunova/containers.json`). Allowed image(s) needed: `<image name without the tag, e.g. bbernhard/signal-cli-rest-api>`. Expected memory use: `<memory_mb>` MB. `mode=check` should then list `containers: True`.

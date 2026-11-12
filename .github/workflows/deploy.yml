@@ -1,4 +1,4 @@
-# Reusable Lunova deploy workflow (v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
+# Reusable Lunova deploy workflow (v8: v7 + `type: service`, an internal allow-listed container with no domain (e.g. the Signal gateway); v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
 # self-hosted runner instances sharing one gh-runner user don't race on each other's key/known_hosts).
 # Public on purpose: it contains no secrets.
 # There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
@@ -58,7 +58,7 @@ jobs:
           {
             echo "SITE=$(yq -r '.site' "$MANIFEST")"
             echo "TYPE=$(yq -r '.type' "$MANIFEST")"
-            echo "DOMAINS=$(yq -r '.domains | join(",")' "$MANIFEST")"
+            echo "DOMAINS=$(yq -r '(.domains // []) | join(",")' "$MANIFEST")"
             echo "ROOT=$(yq -r '.root // ""' "$MANIFEST")"
             echo "START=$(yq -r '.start // ""' "$MANIFEST")"
             echo "HEALTH=$(yq -r '.health_path // "/"' "$MANIFEST")"
@@ -112,6 +112,7 @@ jobs:
         run: |
           set -uo pipefail
           "$LUNOVA_DIR/lsh" lunova-site capabilities
+          if [ "$TYPE" = "service" ]; then echo "::notice::Preflight passed (an internal service has no domain; see 'containers' above)"; exit 0; fi
           IFS=, read -ra D <<< "$DOMAINS"
           "$LUNOVA_DIR/lsh" lunova-site check-domain --site "$SITE" "${D[@]}"
           rc=$?
@@ -177,7 +178,7 @@ jobs:
             case "$TYPE" in
               laravel) cmds=("composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction") ;;
               node|spa|static) cmds=("[ ! -f package.json ] || npm ci" "[ ! -f package.json ] || npm run build --if-present") ;;
-              python) cmds=() ;;
+              python|service) cmds=() ;;
             esac
           else
             mapfile -t cmds < <(yq -r '.build[]' "$MANIFEST")
@@ -188,7 +189,16 @@ jobs:
         if: env.MODE == 'deploy'
         run: |
           set -euo pipefail
-          args=(lunova-site register --site "$SITE" --type "$TYPE" --domains "$DOMAINS" --health-path "$HEALTH")
+          args=(lunova-site register --site "$SITE" --type "$TYPE" --health-path "$HEALTH")
+          [ -n "$DOMAINS" ] && args+=(--domains "$DOMAINS")
+          if [ "$TYPE" = "service" ]; then
+            # an internal container: image, ports, fixed (non-secret) env and named data volumes. Secrets go in .lunova/env.sealed.
+            args+=(--image "$(yq -r '.image // ""' "$MANIFEST")" --container-port "$(yq -r '.container_port // ""' "$MANIFEST")")
+            hp=$(yq -r '.host_port // ""' "$MANIFEST"); [ -n "$hp" ] && args+=(--host-port "$hp")
+            mem=$(yq -r '.memory_mb // ""' "$MANIFEST"); [ -n "$mem" ] && args+=(--memory "$mem")
+            while IFS= read -r kv; do [ -n "$kv" ] && args+=(--env "$kv"); done < <(yq -r '.env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "$MANIFEST")
+            while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done < <(yq -r '.volumes // [] | .[]' "$MANIFEST")
+          fi
           [ -n "$ROOT" ] && args+=(--root "$ROOT")
           [ -n "$START" ] && args+=(--start "$START")
           [ "$HTTP_ONLY" = "true" ] && args+=(--http-only)
@@ -238,5 +248,5 @@ jobs:
           {
             echo "### Lunova deploy: $SITE"
             echo "- Release: \`$RELEASE_ID\`"
-            IFS=, read -ra D <<< "$DOMAINS"; for d in "${D[@]}"; do echo "- https://$d"; done
+            if [ "$TYPE" = "service" ]; then echo "- internal service (no domain), image \`$(yq -r '.image' "$MANIFEST")\`"; else IFS=, read -ra D <<< "$DOMAINS"; for d in "${D[@]}"; do echo "- https://$d"; done; fi
           } >> "$GITHUB_STEP_SUMMARY"
