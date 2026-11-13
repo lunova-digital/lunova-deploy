@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """lunova-site: register, release, check and roll back sites on the Lunova server.
 
-Runs as the unprivileged `deploy` user. Privileged actions: sudo caddy-reload, lunova-provision, lunova-db and (service sites) lunova-container.
+Runs as the unprivileged `deploy` user. Privileged actions: sudo caddy-reload, lunova-provision, lunova-db, lunova-priv (v10: certificate, backup dir, root-only secret files, config validation) and (service sites) lunova-container.
 Layout: /srv/sites/<site>/{releases/<id>,current,shared}, /etc/caddy/sites/<site>.caddy,
         ~/.config/systemd/user/site-<site>.service, /srv/registry/sites/<site>.json
 All output is human readable; machine-readable results are printed as a final `RESULT {json}` line.
 """
-import argparse, hashlib, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, time, urllib.request
+import argparse, gzip, hashlib, ipaddress, json, os, re, secrets, shlex, shutil, socket, sqlite3, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 # Verified caller identity, exported by lunova-gate from the GitHub OIDC token. Unset when ops run this directly.
 WHO = os.environ.get("LUNOVA_REPO") or None
 REF = os.environ.get("LUNOVA_REF") or ""
+EVENT = os.environ.get("LUNOVA_EVENT") or ""              # push | pull_request | workflow_dispatch ... (from the verified OIDC token)
+ENVIRONMENT = os.environ.get("LUNOVA_ENVIRONMENT") or ""  # the GitHub environment the job ran in (e.g. production), from the token
+ACTOR = os.environ.get("LUNOVA_ACTOR") or ("ops" if not os.environ.get("LUNOVA_REPO") else "-")
 
 SITES = Path("/srv/sites"); REG = Path("/srv/registry"); CADDY = Path("/etc/caddy/sites")
 UNITS = Path.home() / ".config/systemd/user"
@@ -19,6 +22,29 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
 HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 TYPES = ("static", "spa", "node", "python", "laravel", "service", "docker")
+# --- v10: tenancy (one wildcard name + a platform host served by one app), seeders, tasks, privileged modes -------------------------
+WILDCARD_RE = re.compile(r"^\*\.(?=.{1,250}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+CERT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,60}$")
+SEEDER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\\]{0,120}$")
+TASK_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}$")
+TASK_CMD_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}:[a-z0-9:_-]{1,60}$")  # the artisan command itself: namespaced like access:super-admin (no bare tinker/down/rm)
+TASK_TOKEN_RE = re.compile(r"^[A-Za-z0-9:_./=@{}-]{1,120}$")          # later tokens: no spaces, quotes, $, `, ;, |, &, <, >
+PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+VALUE_RES = {                                                           # the only placeholders a task may use, and what each may hold
+    "email": re.compile(r"^[A-Za-z0-9._%+][A-Za-z0-9._%+-]{0,63}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,}$"),
+    "name": re.compile(r"^\w[\w .'-]{0,79}$"),
+}
+CERTS = Path("/etc/caddy/certs"); BACKUPS = Path("/srv/backups")
+PRIV = "/usr/local/sbin/lunova-priv"
+# Server-side policy per mode. The workflow file is NOT trusted for this: the gate only proves "an allowed repo ran the shared workflow".
+#   events: GitHub events allowed (the identity comes from the OIDC token) · env: required GitHub environment (reviewers gate it) · confirm: typed site name
+MODE_POLICY = {
+    "tenancy-setup":   {"events": ("workflow_dispatch",), "env": "production", "confirm": True},
+    "reset-db":        {"events": ("workflow_dispatch",), "env": "production", "confirm": True},
+    "bootstrap-admin": {"events": ("workflow_dispatch",), "env": "production", "confirm": True},
+    "backup":          {"events": ("workflow_dispatch",), "env": None, "confirm": False},
+    "run":             {"events": ("workflow_dispatch",), "env": None, "confirm": False},
+}
 CONTAINER = "/usr/local/sbin/lunova-container"
 RESERVED = {"default", "caddy", "registry", "lunova", "admin", "root", "deploy", "ops"}
 KEEP = 3
@@ -238,8 +264,12 @@ def php_env(ver):
     return {**os.environ, "PATH": f"{PHP_SHIMS / ver}:{os.environ.get('PATH', '')}"}
 
 
+def covered_by(host, root):
+    """True when a certificate for root and *.root covers this host (the apex or one label below it)."""
+    return host == root or (host.endswith("." + root) and "." not in host[: -len(root) - 1].lstrip("*."))
+
+
 def render_caddy(site, d):
-    hosts = ", ".join((f"http://{h}" if d.get("http_only") else h) for h in d["domains"])
     cur = f"/srv/sites/{site}/current"
     t = d["type"]
     if t in ("static", "spa"):
@@ -251,7 +281,20 @@ def render_caddy(site, d):
     else:  # laravel
         body = (f"\troot * {cur}/public\n\tencode zstd gzip\n\tphp_fastcgi unix/{php_socket(php_ver(d))} {{\n"
                 f"\t\tresolve_root_symlink\n\t}}\n\tfile_server\n")
-    return f"# managed by lunova-site (site: {site}, repo: {d.get('repo', '-')})\n{hosts} {{\n{body}}}\n"
+    head = f"# managed by lunova-site (site: {site}, repo: {d.get('repo', '-')})\n"
+    ten = d.get("tenancy")
+    if not (ten and ten.get("wildcard")):
+        hosts = ", ".join((f"http://{h}" if d.get("http_only") else h) for h in d["domains"])
+        return f"{head}{hosts} {{\n{body}}}\n"
+    # Tenancy: the platform host and the wildcard share ONE block (same app root) and use the origin certificate from /etc/caddy/certs
+    # (a wildcard cannot be issued by Caddy's HTTP challenge). Any other domain of the site keeps Caddy's automatic certificates.
+    root = ten["root_domain"]
+    mine = [h for h in d["domains"] if h.startswith("*.") or covered_by(h, root)]
+    rest = [h for h in d["domains"] if h not in mine]
+    tls = f"\ttls {CERTS}/{ten['tls_cert']}.pem {CERTS}/{ten['tls_cert']}.key\n"
+    out = f"{head}{', '.join(mine)} {{\n{tls}{body}}}\n"
+    if rest: out += f"\n{', '.join(rest)} {{\n{body}}}\n"
+    return out
 
 
 def render_service_caddy(site, d, pw_hash):
@@ -408,6 +451,302 @@ def build_env(site):
     write_secret(shared / ".env", dump_env(kv)); return True
 
 
+# --- v10: manifest extras (tenancy, seeders, tasks): pure validators, unit-tested without a server ------------------------------------
+def parse_tenancy(t):
+    """The manifest's `tenancy:` block -> normalized dict (or None). Strict: unknown keys are an error so a typo can't silently disable it."""
+    if t in (None, {}, ""): return None
+    if not isinstance(t, dict): die("tenancy must be a map")
+    unknown = set(t) - {"root_domain", "platform_host", "wildcard", "tls_cert"}
+    if unknown: die(f"unknown tenancy key(s): {', '.join(sorted(unknown))}")
+    root = str(t.get("root_domain") or "").lower(); plat = str(t.get("platform_host") or "").lower()
+    if not HOST_RE.match(root): die(f"tenancy.root_domain '{root}' is not a valid domain")
+    if not HOST_RE.match(plat) or not (plat == root or plat.endswith("." + root)):
+        die(f"tenancy.platform_host '{plat}' must be root_domain or a name under it")
+    wild = t.get("wildcard", False)
+    if not isinstance(wild, bool): die("tenancy.wildcard must be true or false")
+    cert = t.get("tls_cert")
+    if cert is not None and not CERT_RE.match(str(cert)): die(f"tenancy.tls_cert '{cert}' is not a valid certificate name")
+    if wild and not cert: die("tenancy.wildcard needs tenancy.tls_cert (a wildcard cannot be issued automatically: install an origin certificate)")
+    return {"root_domain": root, "platform_host": plat, "wildcard": wild, "tls_cert": str(cert) if cert else None}
+
+
+def wildcard_host(ten): return f"*.{ten['root_domain']}"
+
+
+def build_domains(listed, ten):
+    """The final host list. HOST_RE for ordinary names; exactly one `*.<root_domain>` and only when tenancy.wildcard + tls_cert are set.
+    With tenancy the platform host comes first (health check and APP_URL use domains[0]) and the wildcard last."""
+    out = []
+    for h in listed:
+        h = h.lower().strip()
+        if not h: continue
+        if h.startswith("*."):
+            if not (ten and ten["wildcard"] and ten["tls_cert"]): die(f"wildcard host '{h}' needs tenancy.wildcard: true and tenancy.tls_cert")
+            if h != wildcard_host(ten): die(f"the only wildcard allowed is {wildcard_host(ten)} (got '{h}')")
+            if not WILDCARD_RE.match(h): die(f"invalid wildcard host '{h}'")
+        elif not HOST_RE.match(h): die(f"invalid domain '{h}'")
+        if h not in out: out.append(h)
+    if ten:
+        out = [h for h in out if h != ten["platform_host"] and not h.startswith("*.")]
+        out = [ten["platform_host"], *out] + ([wildcard_host(ten)] if ten["wildcard"] else [])
+    return out
+
+
+def parse_seeders(v):
+    if v is None: return None
+    if not isinstance(v, list) or len(v) > 30: die("seeders must be a short list of class names")
+    for c in v:
+        if not isinstance(c, str) or not SEEDER_RE.match(c): die(f"invalid seeder class '{c}'")
+    return list(dict.fromkeys(v))
+
+
+def parse_tasks(v):
+    """tasks: {name: "artisan-command arg {placeholder} ..."}. Tokens only, never a shell. Placeholders from VALUE_RES only."""
+    if v is None: return None
+    if not isinstance(v, dict) or len(v) > 20: die("tasks must be a small map of name -> command")
+    out = {}
+    for name, tpl in v.items():
+        if not TASK_NAME_RE.match(str(name)): die(f"invalid task name '{name}'")
+        if not isinstance(tpl, str) or len(tpl) > 300: die(f"task '{name}' must be a string")
+        try: toks = shlex.split(tpl)
+        except ValueError: die(f"task '{name}' cannot be parsed")
+        if not toks or not TASK_CMD_RE.match(toks[0]): die(f"task '{name}': the first word must be an artisan command like access:super-admin")
+        for tok in toks[1:]:
+            if not TASK_TOKEN_RE.match(tok): die(f"task '{name}': '{tok}' has characters that are not allowed")
+        for ph in PLACEHOLDER_RE.findall(tpl):
+            if ph not in VALUE_RES: die(f"task '{name}': unknown placeholder {{{ph}}} (allowed: {', '.join(sorted(VALUE_RES))})")
+        if re.sub(PLACEHOLDER_RE, "", tpl).count("{") or re.sub(PLACEHOLDER_RE, "", tpl).count("}"): die(f"task '{name}': stray brace")
+        out[name] = " ".join(toks)
+    return out
+
+
+def expand_task(tpl, values):
+    """Task template + validated values -> an argv list for `php artisan` (no shell is ever involved)."""
+    out = []
+    for tok in shlex.split(tpl):
+        def sub(m):
+            k = m.group(1); v = values.get(k)
+            if v is None: die(f"task needs a value for {{{k}}}")
+            if not VALUE_RES[k].match(v) or v.startswith("-"): die(f"invalid value for {{{k}}}")
+            return v
+        out.append(PLACEHOLDER_RE.sub(sub, tok))
+    return out
+
+
+def parse_args_kv(items):
+    out = {}
+    for kv in items or []:
+        k, sep, v = kv.partition("=")
+        if not sep or k not in VALUE_RES: die(f"bad --arg '{k}' (allowed: {', '.join(sorted(VALUE_RES))})")
+        out[k] = v
+    return out
+
+
+URL_RE = re.compile(r"https?://\S+"); TOKEN_RE = re.compile(r"[A-Za-z0-9_\-+/=%.]{28,}")
+
+
+def redact(text):
+    """Anything that looks like a link or a long token is removed before output leaves the server (invite / set-password links)."""
+    return TOKEN_RE.sub("<redacted>", URL_RE.sub("<link redacted>", text or ""))
+
+
+# --- v10: privileged modes: identity policy, audit line, root helper ------------------------------------------------------------------
+def audit(mode, site, result):
+    """One line per privileged action: who, what, where, when. Written best-effort (never blocks the action)."""
+    clean = lambda v: re.sub(r"[^\w.@:/+()-]", "_", str(v or "-"))[:120]
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} actor={clean(ACTOR)} repo={clean(WHO)} ref={clean(REF)} mode={clean(mode)} site={clean(site)} result={clean(result)}\n"
+    try:
+        with open(REG / "audit.log", "a") as f: f.write(line)
+    except OSError: pass
+
+
+def authorize_mode(mode, site, confirm):
+    """Identity gate for a mode, on top of the gate's owner/workflow check: event, GitHub environment, typed confirmation, repo+branch binding."""
+    pol = MODE_POLICY[mode]
+    if reg_path(site).exists(): load(site, write=True)         # repo and deploy branch (not for a first tenancy-setup: the site is bound there)
+    elif mode != "tenancy-setup": die(f"site '{site}' is not registered")
+    if WHO:  # through the gate: identity comes from the OIDC token
+        if EVENT not in pol["events"]: die(f"mode '{mode}' runs only from a manual workflow run (this was a '{EVENT or 'unknown'}' event)")
+        if pol["env"] and ENVIRONMENT != pol["env"]:
+            die(f"mode '{mode}' must run in the GitHub environment '{pol['env']}' (with required reviewers); this run was in '{ENVIRONMENT or 'none'}'")
+        if mode == "tenancy-setup" and not reg_path(site).exists() and not REF.startswith("refs/heads/"): die("run from a branch")
+    if pol["confirm"] and confirm != site: die(f"confirmation does not match: type the site name '{site}' exactly")
+
+
+def moded(mode):
+    """Command wrapper: authorize by MODE_POLICY, then write start/result audit lines."""
+    def deco(fn):
+        def wrapper(a):
+            check_name(a.site)
+            try: authorize_mode(mode, a.site, getattr(a, "confirm", None))
+            except SystemExit: audit(mode, a.site, "DENIED"); raise
+            audit(mode, a.site, "start")
+            try: fn(a)
+            except SystemExit as e:
+                audit(mode, a.site, "ok" if e.code in (0, None) else f"FAIL({e.code})"); raise
+            audit(mode, a.site, "ok")
+        return wrapper
+    return deco
+
+
+def priv(*args, data=None, check=True):
+    """The ONE root helper (narrow sudoers rule). Secrets go in on stdin, never argv."""
+    p = subprocess.run(["sudo", "-n", PRIV, *args], input=data, text=True, capture_output=True)
+    if check and p.returncode != 0: die(f"privileged helper failed ({args[0]}): {(p.stdout + p.stderr).strip()[-800:]}")
+    return p
+
+
+def need_laravel(d):
+    if d["type"] != "laravel": die("this mode runs `php artisan`: it needs a laravel site")
+    if not (SITES / d["site"] / "current").exists(): die("no release is live yet: deploy first")
+
+
+def artisan(d, *args, check=True):
+    """`php artisan ...` in the live release as the site's PHP version. argv list, never a shell."""
+    ver = php_ver(d); cur = SITES / d["site"] / "current"
+    return run([php_bin(ver), "artisan", *args], cwd=cur, check=check, env=php_env(ver))
+
+
+# --- backup ----------------------------------------------------------------------------------------------------------------------
+def do_backup(d):
+    """Dump the site's database to /srv/backups/<site>/ (mysql or sqlite), prove it is a readable gzip, return path/size/sha256. Never uploaded."""
+    site = d["site"]; engine = d.get("database")
+    if engine not in ("mysql", "sqlite"): die(f"backup supports mysql and sqlite sites (this site uses '{engine}'): refusing rather than pretend")
+    priv("ensure-backup-dir", site)
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    final = BACKUPS / site / f"{site}-{ts}.{'sql' if engine == 'mysql' else 'sqlite'}.gz"; tmp = final.with_name(final.name + ".part")
+    dbenv = parse_env((SITES / site / "shared" / "db.env").read_text()) if (SITES / site / "shared" / "db.env").exists() else {}
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz:
+            if engine == "mysql":
+                for k in ("DB_HOST", "DB_PORT", "DB_DATABASE", "DB_USERNAME", "DB_PASSWORD"):
+                    if not dbenv.get(k): die(f"{k} is missing from the site's database settings")
+                cmd = ["mysqldump", "--single-transaction", "--quick", "--routines", "--triggers", "--no-tablespaces",
+                       "-h", dbenv["DB_HOST"], "-P", dbenv["DB_PORT"], "-u", dbenv["DB_USERNAME"], dbenv["DB_DATABASE"]]
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={**os.environ, "MYSQL_PWD": dbenv["DB_PASSWORD"]})
+                last = b""
+                for chunk in iter(lambda: p.stdout.read(1 << 16), b""): gz.write(chunk); last = (last + chunk)[-300:]
+                err = p.stderr.read().decode(errors="replace"); rc = p.wait()
+                if rc != 0: die(f"mysqldump failed ({rc}): {err.strip()[-500:]}")
+                if b"Dump completed" not in last: die("mysqldump output looks truncated (no completion marker): refusing to call it a backup")
+            else:
+                src = Path(dbenv.get("DB_DATABASE") or SITES / site / "shared" / "database.sqlite")
+                mem = Path(str(tmp) + ".db"); a, b = sqlite3.connect(f"file:{src}?mode=ro", uri=True), sqlite3.connect(mem)
+                try: a.backup(b)
+                finally: a.close(); b.close()
+                gz.write(mem.read_bytes()); mem.unlink()
+        g = subprocess.run(["gzip", "-t", str(tmp)], capture_output=True, text=True)
+        if g.returncode != 0: die(f"gzip -t failed: {g.stderr.strip()}")
+        tmp.replace(final)
+    except BaseException:
+        tmp.unlink(missing_ok=True); raise
+    h = hashlib.sha256()
+    with open(final, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
+    return {"path": str(final), "size": final.stat().st_size, "sha256": h.hexdigest()}
+
+
+@moded("backup")
+def cmd_backup(a):
+    d = load(a.site)
+    b = do_backup(d)
+    say(f"backup written: {b['path']}  size={b['size']} bytes  sha256={b['sha256']}  (kept on this server only; never uploaded)")
+    result(ok=True, site=a.site, **b)
+
+
+# --- reset-db ----------------------------------------------------------------------------------------------------------------------
+@moded("reset-db")
+def cmd_reset_db(a):
+    d = load(a.site); need_laravel(d)
+    seeders = d.get("seeders")
+    if seeders is None: die("this site's manifest has no `seeders:` list (use `seeders: []` to allow a reset with no seeding)")
+    b = do_backup(d)    # FIRST, and any failure aborts: nothing below runs without a verified backup
+    say(f"backup verified: {b['path']}  size={b['size']}  sha256={b['sha256']}")
+    artisan(d, "migrate:fresh", "--force"); say("migrate:fresh done")
+    for s in seeders:
+        artisan(d, "db:seed", f"--class={s}", "--force"); say(f"seeded {s}")
+    for c in ("optimize:clear", "config:cache", "route:cache", "view:cache", "event:cache"): artisan(d, c)
+    artisan(d, "queue:restart")
+    say("caches rebuilt, queue workers restarted")
+    result(ok=True, site=a.site, backup=b["path"], seeders=seeders)
+
+
+# --- allow-listed tasks (run, bootstrap-admin) ----------------------------------------------------------------------------------------
+def task_argv(d, name, values):
+    tasks = d.get("tasks") or {}
+    if name not in tasks: die(f"task '{name}' is not in this site's manifest `tasks:` (allowed: {', '.join(sorted(tasks)) or 'none'})")
+    return expand_task(tasks[name], values)
+
+
+@moded("run")
+def cmd_run(a):
+    d = load(a.site); need_laravel(d)
+    argv = task_argv(d, a.task, parse_args_kv(a.arg))
+    p = artisan(d, *argv, check=False)
+    out = redact((p.stdout + p.stderr).strip())
+    say(out[-3000:] if out else "(no output)")
+    if p.returncode != 0: die(f"task '{a.task}' failed ({p.returncode})")
+    result(ok=True, site=a.site, task=a.task)
+
+
+@moded("bootstrap-admin")
+def cmd_bootstrap_admin(a):
+    d = load(a.site); need_laravel(d)
+    vals = parse_args_kv(a.arg)
+    if not vals.get("email") or not vals.get("name"): die("bootstrap-admin needs admin_email and admin_name")
+    argv = task_argv(d, "super_admin", vals)
+    p = artisan(d, *argv, check=False)
+    full = p.stdout + p.stderr
+    links = len(URL_RE.findall(full))
+    # Whatever the command printed (possibly a set-password / invite link) goes to a ROOT-ONLY file on the server and nowhere else.
+    path = priv("store-secret", a.site, "bootstrap-admin", data=full).stdout.strip() if full.strip() else ""
+    if p.returncode != 0:
+        say(redact(full.strip())[-1500:] or "(no output)"); die(f"the admin task failed ({p.returncode}); nothing was printed that could contain a link")
+    say(f"admin task finished for {vals['email']}. {links} link(s) in its output were NOT printed." + (f" Full output, root-only: {path}" if path else ""))
+    say("The admin should get an emailed invite / set-password link from the app; if the app printed one instead, read it from the file above (ssh as ops).")
+    result(ok=True, site=a.site, secret_file=path or None, links=links)
+
+
+@moded("tenancy-setup")
+def cmd_tenancy_setup(a):
+    """Install the origin certificate (stdin JSON {cert,key}, via the root helper), then (re-)register the site with its tenancy block so the
+    Caddy file serves platform_host + the wildcard from one app root. Idempotent. Works before the first deploy (it registers the site)."""
+    ten = parse_tenancy(json.loads(a.tenancy_json)) if a.tenancy_json else None
+    if not ten: die("tenancy-setup needs a `tenancy:` block in .lunova.yml")
+    if a.type not in ("laravel", "static", "spa"): die("tenancy-setup supports laravel, static and spa sites")
+    blob = "" if sys.stdin.isatty() else sys.stdin.read(40000)
+    if blob.strip():
+        if not ten["tls_cert"]: die("a certificate was sent but tenancy.tls_cert (its name) is not set")
+        try: b = json.loads(blob); cert, key = b["cert"], b["key"]
+        except (ValueError, KeyError, TypeError): die("certificate bundle must be JSON with `cert` and `key`")
+        say(priv("install-cert", ten["tls_cert"], ten["root_domain"], data=json.dumps({"cert": cert, "key": key})).stdout.strip())
+    else:
+        say("no certificate sent: keeping the one already installed")
+    old = all_sites().get(a.site) or {}
+    ns = argparse.Namespace(site=a.site, type=a.type, domains=a.domains or ",".join(old.get("domains") or []), repo=None, start=None,
+                            root=a.root or old.get("root"), database=old.get("database"), package=old.get("packages"), php=a.php or old.get("php"),
+                            queue=old.get("queue"), scheduler=old.get("scheduler"), health_path=a.health_path or old.get("health_path") or "/",
+                            hook=old.get("hooks") if old else None, http_only=False, image=None, container_port=None, host_port=None,
+                            public_host=None, public_path=None, public_user=None, env=None, volume=None, memory=512,
+                            tenancy_json=a.tenancy_json, seeders_json=a.seeders_json, tasks_json=a.tasks_json)
+    cmd_register(ns)
+    say(f"tenancy ready: {ten['platform_host']} and {wildcard_host(ten) if ten['wildcard'] else '(no wildcard)'} serve one app root")
+    result(ok=True, site=a.site, platform_host=ten["platform_host"], wildcard=ten["wildcard"])
+
+
+def cmd_show_config(a):
+    """The rendered site config as it is on disk, plus the web server's own validation result (run by the root helper: the key is not readable by deploy)."""
+    check_name(a.site); d = load(a.site)
+    f = CADDY / f"{a.site}.caddy"
+    say("== rendered config"); say(f.read_text() if f.exists() else "(no config file)")
+    v = priv("validate", check=False)
+    ok = v.returncode == 0
+    say("== web server validation: " + ("OK" if ok else "FAILED")); say((v.stdout + v.stderr).strip()[-1500:])
+    result(ok=ok, site=a.site, domains=d.get("domains"), tenancy=d.get("tenancy"))
+    sys.exit(0 if ok else 2)
+
+
 def cmd_capabilities(a):
     def ver(c, flag="--version"):
         p = run([c, flag], check=False) if shutil.which(c) else None
@@ -432,6 +771,7 @@ def cmd_check_domain(a):
     ip = cfg().get("public_ip"); bad = []
     for h in a.domains:
         h = h.lower()
+        if WILDCARD_RE.match(h): say(f"OK {h} (wildcard: checked by the verify probe with a random label, not by DNS lookup)"); continue
         if not HOST_RE.match(h): bad.append((h, "invalid hostname")); continue
         owner = next((s for s, d in all_sites().items() if h in d["domains"] and s != a.site), None)
         if owner: bad.append((h, f"already used by site '{owner}'")); continue
@@ -452,10 +792,20 @@ def cmd_register(a):
     check_name(a.site)
     if a.type not in TYPES: die(f"type must be one of {', '.join(TYPES)}")
     domains = [h.lower() for h in (a.domains or "").split(",") if h.strip()]
+    def jarg(name):
+        v = getattr(a, name, None)
+        if not isinstance(v, str) or not v.strip(): return None
+        try: return json.loads(v)
+        except ValueError: die(f"--{name.replace('_', '-')} is not valid JSON")
+    tenancy, seeders, tasks = parse_tenancy(jarg("tenancy_json")), parse_seeders(jarg("seeders_json")), parse_tasks(jarg("tasks_json"))
     if a.type == "service" and domains: die("a service is internal: it takes no domain (only the workspace on this server reaches it, on 127.0.0.1)")
-    if a.type != "service" and not domains: die("at least one domain is required")
-    for h in domains:
-        if not HOST_RE.match(h): die(f"invalid domain '{h}'")
+    if a.type == "service" and tenancy: die("tenancy is for web sites; a service has no domain")
+    if a.type != "service" and not (domains or tenancy): die("at least one domain is required")
+    if tenancy and a.http_only: die("tenancy serves over HTTPS with an installed certificate: remove http_only")
+    if (seeders is not None or tasks) and a.type != "laravel": die("seeders and tasks run `php artisan`: they are for laravel sites")
+    if a.type != "service": domains = build_domains(domains, tenancy)
+    if tenancy and tenancy["wildcard"] and not ((CERTS / f"{tenancy['tls_cert']}.pem").exists() and (CERTS / f"{tenancy['tls_cert']}.key").exists()):
+        die(f"origin certificate '{tenancy['tls_cert']}' is not installed in {CERTS}: run mode tenancy-setup with the ORIGIN_CERT and ORIGIN_KEY secrets first")
     sites = all_sites(); old = sites.get(a.site)
     if WHO:  # through the gate: identity comes from the OIDC token, never from arguments
         a.repo = WHO
@@ -483,7 +833,7 @@ def cmd_register(a):
          "root": a.root or "", "http_only": bool(a.http_only), "health_path": a.health_path,
          "hooks": a.hook if a.hook is not None else DEFAULT_HOOKS.get(a.type, []),
          "php": php if a.type == "laravel" else None, "database": a.database, "queue": bool(a.queue), "scheduler": bool(a.scheduler), "packages": sorted(set(pkgs)),
-         "branch": branch}
+         "branch": branch, "tenancy": tenancy, "seeders": seeders, "tasks": tasks}
     if (a.queue or a.scheduler) and a.type != "laravel": die("--queue/--scheduler are only supported for laravel sites")
     if a.type in ("node", "python"):
         if not a.start and not (old and old.get("start")): die("--start is required for node/python sites")
@@ -862,7 +1212,17 @@ def main():
     r.add_argument("--image"); r.add_argument("--container-port", type=int); r.add_argument("--host-port", type=int)
     r.add_argument("--public-host"); r.add_argument("--public-path", action="append"); r.add_argument("--public-user")
     r.add_argument("--env", action="append"); r.add_argument("--volume", action="append"); r.add_argument("--memory", type=int, default=512)
+    r.add_argument("--tenancy-json"); r.add_argument("--seeders-json"); r.add_argument("--tasks-json")
     r.set_defaults(f=cmd_register)
+    t = sp.add_parser("tenancy-setup"); t.add_argument("site"); t.add_argument("--confirm", default=""); t.add_argument("--type", required=True)
+    t.add_argument("--domains", default=""); t.add_argument("--root"); t.add_argument("--php"); t.add_argument("--health-path")
+    t.add_argument("--tenancy-json"); t.add_argument("--seeders-json"); t.add_argument("--tasks-json"); t.set_defaults(f=cmd_tenancy_setup)
+    sp.add_parser("backup").add_argument("site"); sp.choices["backup"].set_defaults(f=cmd_backup)
+    rd = sp.add_parser("reset-db"); rd.add_argument("site"); rd.add_argument("--confirm", default=""); rd.set_defaults(f=cmd_reset_db)
+    ba = sp.add_parser("bootstrap-admin"); ba.add_argument("site"); ba.add_argument("--confirm", default=""); ba.add_argument("--arg", action="append")
+    ba.set_defaults(f=cmd_bootstrap_admin)
+    rn = sp.add_parser("run"); rn.add_argument("site"); rn.add_argument("--task", required=True); rn.add_argument("--arg", action="append"); rn.set_defaults(f=cmd_run)
+    sc = sp.add_parser("show-config"); sc.add_argument("site"); sc.set_defaults(f=cmd_show_config)
     x = sp.add_parser("release"); x.add_argument("site"); x.add_argument("id"); x.set_defaults(f=cmd_release)
     b = sp.add_parser("rollback"); b.add_argument("site"); b.add_argument("--to"); b.set_defaults(f=cmd_rollback)
     s = sp.add_parser("status"); s.add_argument("site"); s.set_defaults(f=cmd_status)
