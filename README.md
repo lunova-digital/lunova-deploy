@@ -7,6 +7,8 @@ skills/lunova-deploy/   Claude Code skill (what developers use)
 `.github/workflows/deploy.yml`  shared reusable workflow (called by developer repos, tagged v1)
 server/lunova-site      server helper: register / release / rollback / status (installed at /usr/local/bin)
 server/lunova-container root helper that runs an allow-listed container for `type: service` sites (installed at /usr/local/sbin)
+server/lunova-priv      root helper for the v10 privileged modes: origin certificate, backup dir, root-only secret files, config validation (installed at /usr/local/sbin)
+ops/setup-tenancy       one-time ops script: lunova-priv + sudoers line + cert/backup/secret dirs + v10 lunova-site/lunova-gate
 ops/setup-containers    one-time ops script: Docker + the helper + the image allow-list
 ops/setup-docker-rootless  one-time ops script: rootless Docker for `deploy` (type: docker sites) + installs lunova-site
 tests/                  offline tests: python3 -m unittest discover -s tests
@@ -41,12 +43,23 @@ A site can be an **internal container** instead of a web site: no domain, no cer
 - **Public admin name (v9, optional `public:`)**: a service may publish only the allow-listed admin paths (`/v1/qrcodelink`, `/v1/register`, `/v1/accounts`, `/v1/about`, `/v1/health`) on an HTTPS name, behind basic auth (user from the manifest, password = sealed `LUNOVA_PUBLIC_PASSWORD`, hashed on the server with `caddy hash-password`; only the hash is written to the Caddy file). Any other path is a 404, so message sending/receiving can never be reached from outside. `lunova-site` enforces the path allow-list server-side, not just the manifest.
 - Secrets for a service travel as sealed env like any site; they are written to a root-only temp env-file for `docker run` and removed.
 
+## Wildcard tenancy, backup, reset-db, bootstrap-admin (v10)
+Manifest keys `tenancy:` (root_domain, platform_host, wildcard, tls_cert), `seeders:` and `tasks:` (see `skills/lunova-deploy/references/tenancy.md`, which also has the one-time GitHub/Cloudflare/ops setup and the first-run order `tenancy-setup -> deploy -> check -> reset-db -> bootstrap-admin`). New workflow modes: `tenancy-setup`, `backup`, `reset-db`, `bootstrap-admin`, `run`.
+- **Two jobs.** `tenancy-setup`, `reset-db` and `bootstrap-admin` run in `lunova-privileged`, bound to the GitHub environment `production` (required reviewers). `lunova-gate` now exports the token's `environment` claim as `LUNOVA_ENVIRONMENT`; `lunova-site` refuses those modes unless it is `production`, the event is `workflow_dispatch`, the repo and branch match the site, and the typed `confirm` equals the site name. `backup` and `run` are manual-only but not environment-gated.
+- **One root helper**, `lunova-priv` (one sudoers line): install the origin cert (pair/expiry/SAN checks, validate, reload, previous cert restored on failure), create `/srv/backups/<site>`, write a root-only secret file, validate the web server config. Secrets go in on stdin.
+- **No password anywhere.** `bootstrap-admin` takes email and name; the command's output (an invite link, say) is stored root-only on the server and never returned; failure output is redacted.
+- **Tasks and seeders are allow-lists stored in the registry at deploy time**; `run` never executes a shell: the template is split into tokens, `{email}`/`{name}` are validated and substituted per token, and the command runs as `php artisan <argv>`.
+- **Audit**: one line per privileged call in `/srv/registry/audit.log` (time, actor, repo, ref, mode, site, result).
+- **Caddy only.** There is no nginx path in this repo; the wildcard is rendered for Caddy (`tls /etc/caddy/certs/<name>.pem …`).
+- Enable on the server once: `ops/setup-tenancy` (ops request #8).
+
 ## Known limits
 - Anyone who can push to the deploy branch of an allowed-owner repo deploys that site. Protect the branch in GitHub if that matters.
 - Owners are trusted: a `packages:` entry or a hook in a repo of an allowed owner runs on the server as that site's deploy.
 - GitHub Free: OIDC works on every plan, and a public workflow repo is what lets private repos call it.
 
 ## Test status
+- **v10 (tenancy and privileged modes):** `tests/test_tenancy.py`, offline: manifest schema, `HOST_RE`/wildcard rules, Caddy wildcard golden render, register with tenancy, task/seeder allow-lists and argument injection, output masking, backup-before-reset ordering, backup (mysqldump faked, gzip -t and sqlite real), mode policy (event, environment, confirm, repo, branch), audit lines, the root helper with generated certificates (including restore on failure), the DNS-sync script against a fake Cloudflare API (idempotent, never replaces a CNAME), the verify classifier, and the workflow's shape (privileged job bound to `production`, no expression interpolated into shell, secrets only in two steps, `bash -n` on every script). **Not run against a real server, GitHub Actions, Caddy or Cloudflare**: see the PR description for the list of assumptions.
 - v8 service sites: `tests/` (offline): allow-list and spec validation, health on the host port, switch and mark on success, previous configuration restored on a failed start or failed health check, no domain accepted. **Not yet run against a real Docker host** and the `yq` expressions in the workflow's service branch are untested on GitHub; the first real deploy is the test (use `mode=check` first).
 - Tested live on the server (simulated verified identity): site/repo/branch binding (other repo, other branch and PR refs refused), sealed env (apply once, DB_* refused, wrong repo refused, names-only status), automatic provisioning (PHP DB driver, apt package, `openssh-server` refused), MariaDB and PostgreSQL creation with generated passwords (real TCP login), Laravel env seeding (production defaults, generated APP_KEY, `.env.example` keys), release + health check.
 - `lunova-gate` token verification unit-tested: valid token accepted; expired, wrong audience/issuer, owner not allowed, right name but wrong owner id, custom workflow, forged signature and unknown key all refused.

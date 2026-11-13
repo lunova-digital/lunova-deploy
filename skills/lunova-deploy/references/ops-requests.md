@@ -25,3 +25,6 @@ Describe what the pipeline could not do and the error text from the workflow log
 
 ## 6. Enable containers / allow an image (internal `type: service`)
 > Please run `ops/setup-containers` from the lunova-deploy repo against the Lunova server (installs Docker, the `lunova-container` helper and the sudo rule, and creates `/etc/lunova/containers.json`). Allowed image(s) needed: `<image name without the tag, e.g. bbernhard/signal-cli-rest-api>`. Expected memory use: `<memory_mb>` MB. `mode=check` should then list `containers: True`.
+
+## 8. Enable wildcard tenancy, backups, reset-db and bootstrap-admin (v10)
+> Please run `ops/setup-tenancy` from the lunova-deploy repo against the Lunova server (installs `lunova-priv` and one sudoers line for `deploy`, the v10 `lunova-site` and `lunova-gate`, `/etc/caddy/certs`, `/srv/backups`, `/var/lib/lunova/secrets`, and `mysqldump`). Afterwards `sudo -u deploy sudo -n /usr/local/sbin/lunova-priv validate` should print a valid Caddy config.

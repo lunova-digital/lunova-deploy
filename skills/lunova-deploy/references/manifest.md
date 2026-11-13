@@ -26,6 +26,9 @@ Lives at the repo root. Read by the shared workflow with `yq`. Unknown keys are 
 | `volumes` | service | Named data volumes, `name:/path/in/container` (at most 4). Kept across releases, rollbacks and `unregister`. Host paths can never be mounted. |
 | `public` | service | Optional `host`, `user` (default `lunova`), `paths` (default: the Signal linking paths). Publishes ONLY allow-listed admin paths of the container (`/v1/qrcodelink`, `/v1/register`, `/v1/accounts`, `/v1/about`, `/v1/health`) on that HTTPS name behind basic auth, so the account can be set up from a browser. Message traffic (send/receive/groups) is never public. The password is the sealed env value `LUNOVA_PUBLIC_PASSWORD` (16+ characters, never in git, never passed to the container). Needs a DNS A record to the server. |
 | `memory_mb` | service | Memory limit (default 512, capped by ops). |
+| `tenancy` | no | Laravel multi-tenancy: `root_domain`, `platform_host`, `wildcard` (bool), `tls_cert` (origin certificate name). Serves the platform host and `*.<root_domain>` from one app root with the origin certificate in `/etc/caddy/certs`. A wildcard is accepted only with `wildcard: true` and `tls_cert`; the only wildcard allowed is `*.<root_domain>`. Installed by workflow mode `tenancy-setup`. See `tenancy.md`. |
+| `seeders` | no | Laravel. Class names `reset-db` may run (`[]` = `migrate:fresh` only). Without the key, `reset-db` is refused. |
+| `tasks` | no | Laravel. `name: "namespaced:artisan-command args"`; the only commands `run` / `bootstrap-admin` may execute (`bootstrap-admin` uses the task named `super_admin`). Placeholders: `{email}`, `{name}` only. Never a shell. |
 | `http_only` | no | Serve over plain HTTP (no certificate). Testing only. |
 
 ## Server paths (for reference, not editable)
