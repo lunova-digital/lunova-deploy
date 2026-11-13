@@ -82,7 +82,7 @@ def cmd_install_cert(name, root):
     except (ValueError, KeyError, TypeError): die("stdin must be JSON with cert and key")
     why = check_pair(cert, key, root)
     if why: audit(f"install-cert:{name}", "REFUSED"); die(why)
-    CERTS.mkdir(parents=True, exist_ok=True); os.chmod(CERTS, 0o750)
+    CERTS.mkdir(parents=True, exist_ok=True); os.chmod(CERTS, 0o751)   # x for others: lunova-site (as deploy) stat()s the files; the key itself stays 0640 root:caddy
     try: os.chown(CERTS, 0, grp.getgrnam("caddy").gr_gid)
     except (KeyError, PermissionError): pass
     pem, kf = CERTS / f"{name}.pem", CERTS / f"{name}.key"

@@ -451,6 +451,15 @@ class RootHelper(unittest.TestCase):
         self.assertEqual(oct((self.p.CERTS / "lunova.key").stat().st_mode & 0o777), "0o640"); self.assertEqual((self.p.CERTS / "lunova.pem").read_text(), c)
         code, out, _ = self.install(c, k); self.assertEqual(code, 0); self.assertIn("unchanged", out)
 
+    def test_the_certs_directory_stays_traversable_for_deploy_and_the_key_stays_private(self):
+        # lunova-site runs as deploy and stat()s <name>.pem/.key; a 0750 root:caddy directory made every register fail with EACCES
+        c, k = self.make(["lunovait.com", "*.lunovait.com"])
+        for _ in range(2):  # the second call is the "unchanged" path, which must not reset the mode either
+            self.assertEqual(self.install(c, k)[0], 0)
+            self.assertEqual(oct(self.p.CERTS.stat().st_mode & 0o777), "0o751")
+        self.assertEqual(oct((self.p.CERTS / "lunova.key").stat().st_mode & 0o777), "0o640")
+        self.assertEqual(oct((self.p.CERTS / "lunova.pem").stat().st_mode & 0o777), "0o644")
+
     def test_refuses_mismatched_expired_or_incomplete_certificates(self):
         c, k = self.make(["lunovait.com", "*.lunovait.com"]); _, other_key = self.make(["lunovait.com", "*.lunovait.com"])
         self.assertIn("does not belong", self.p.check_pair(c, other_key, "lunovait.com"))

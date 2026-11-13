@@ -4,7 +4,7 @@
 # What it changes on the server:
 #   * installs the v10 `lunova-site` (/usr/local/bin) and `lunova-gate` (/usr/local/bin; it now also exports the GitHub environment of the run)
 #   * installs /usr/local/sbin/lunova-priv (the ONE root helper for these modes) and a sudoers rule letting `deploy` run ONLY that helper
-#   * creates /etc/caddy/certs (root:caddy 0750; certificates are installed there by `mode=tenancy-setup`), /srv/backups (0755, per-site dirs are
+#   * creates /etc/caddy/certs (root:caddy 0751: deploy may traverse to stat the files, only the key is group-private; certificates are installed there by `mode=tenancy-setup`), /srv/backups (0755, per-site dirs are
 #     created 0700 for deploy by the helper) and /var/lib/lunova/secrets (0700 root: bootstrap-admin output, e.g. an invite link, lands here)
 #   * requires `mysqldump` (mariadb-client) for backups: installs it if missing
 # Usage:  ops/setup-tenancy [ssh-host]      (default host `lunova`)
@@ -19,7 +19,7 @@ sudo install -m 755 -o root -g root /tmp/lunova-priv /usr/local/sbin/lunova-priv
 sudo install -m 755 -o root -g root /tmp/lunova-site /usr/local/bin/lunova-site
 sudo install -m 755 -o root -g root /tmp/lunova-gate /usr/local/bin/lunova-gate
 rm -f /tmp/lunova-priv /tmp/lunova-site /tmp/lunova-gate
-sudo install -d -m 750 -o root -g caddy /etc/caddy/certs
+sudo install -d -m 751 -o root -g caddy /etc/caddy/certs
 sudo install -d -m 755 -o root -g root /srv/backups
 sudo install -d -m 700 -o root -g root /var/lib/lunova/secrets
 echo 'deploy ALL=(root) NOPASSWD: /usr/local/sbin/lunova-priv' | sudo tee /etc/sudoers.d/lunova-priv >/dev/null
