@@ -22,3 +22,12 @@ domains:
 # exclude: [tests, docs]      # extra paths not to upload
 # include_node_modules: false # upload node_modules built in CI (default: install on server)
 # http_only: false            # true only for testing before DNS/TLS is ready
+# --- optional: wildcard multi-tenancy, first admin, allow-listed tasks (laravel). Read references/tenancy.md first ---
+# tenancy:
+#   root_domain: example.com          # the zone
+#   platform_host: app.example.com    # the main app name; the first host of the site
+#   wildcard: true                    # also serve *.example.com from the same app root
+#   tls_cert: example.com             # name of the origin certificate installed by mode=tenancy-setup (/etc/caddy/certs/<name>.pem/.key)
+# seeders: [DatabaseSeeder]           # the ONLY seeders mode=reset-db may run ([] = migrate:fresh and nothing else)
+# tasks:                              # the ONLY commands mode=run / bootstrap-admin may run. {email} and {name} are the only placeholders
+#   super_admin: "access:super-admin {email} --name={name}"

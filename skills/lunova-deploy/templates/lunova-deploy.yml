@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "deploy | check | rollback | status | logs"
+        description: "deploy | check | rollback | status | logs | backup | run | tenancy-setup | reset-db | bootstrap-admin (the last three need the 'production' environment approved by a reviewer)"
         type: choice
-        options: [deploy, check, rollback, status, logs]
+        options: [deploy, check, rollback, status, logs, backup, run, tenancy-setup, reset-db, bootstrap-admin]
         default: deploy
       rollback_to:
         description: "Release id (empty = previous healthy release)"
@@ -21,8 +21,29 @@ on:
         description: "Log lines (logs mode)"
         type: string
         default: "80"
+      confirm:
+        description: "tenancy-setup / reset-db / bootstrap-admin: type the site name exactly (the 'site:' in .lunova.yml)"
+        type: string
+        default: ""
+      admin_email:
+        description: "bootstrap-admin: the first admin's email. Never a password: the admin gets an invite / set-password link"
+        type: string
+        default: ""
+      admin_name:
+        description: "bootstrap-admin: the first admin's name"
+        type: string
+        default: ""
+      task:
+        description: "run: a task name from tasks: in .lunova.yml"
+        type: string
+        default: ""
+      dns_sync:
+        description: "tenancy-setup: also create the proxied Cloudflare records and the apex redirect (needs the CF_API_TOKEN secret)"
+        type: boolean
+        default: false
 
-# id-token: write lets the run prove its identity to the Lunova server (GitHub OIDC). There are no keys or secrets to set up.
+# id-token: write lets the run prove its identity to the Lunova server (GitHub OIDC). Deploys need no keys or secrets.
+# Only tenancy-setup uses secrets (ORIGIN_CERT, ORIGIN_KEY, CF_API_TOKEN) - see the skill's references/tenancy.md.
 permissions:
   contents: read
   id-token: write
@@ -34,4 +55,13 @@ jobs:
       mode: ${{ github.event_name == 'pull_request' && 'check' || inputs.mode || 'deploy' }}
       rollback_to: ${{ inputs.rollback_to || '' }}
       lines: ${{ inputs.lines || '80' }}
+      confirm: ${{ inputs.confirm || '' }}
+      admin_email: ${{ inputs.admin_email || '' }}
+      admin_name: ${{ inputs.admin_name || '' }}
+      task: ${{ inputs.task || '' }}
+      dns_sync: ${{ inputs.dns_sync || false }}
       self_hosted: __SELF_HOSTED__
+    secrets:
+      ORIGIN_CERT: ${{ secrets.ORIGIN_CERT }}
+      ORIGIN_KEY: ${{ secrets.ORIGIN_KEY }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
