@@ -6,7 +6,7 @@ Access is decided here from the GitHub Actions OIDC token passed with the comman
   - signature verified against GitHub's JWKS (RS256), issuer, audience, expiry (token is the `LUNOVA_TOKEN=<jwt>` prefix of the command)
   - repository_owner AND repository_owner_id must be in /srv/registry/config.json allowed_owners
   - job_workflow_ref must be the shared workflow (so a custom workflow in a repo cannot reach the server)
-Then exactly two commands may run, with the verified identity exported as LUNOVA_REPO / LUNOVA_REF / LUNOVA_EVENT:
+Then exactly two commands may run, with the verified identity exported as LUNOVA_REPO / LUNOVA_REF / LUNOVA_EVENT / LUNOVA_ACTOR / LUNOVA_ENVIRONMENT:
   lunova-site <args...>
   rsync --server ... . /srv/sites/<site>/releases/<id>/   (only for a site bound to this repo and branch)
 lunova-site enforces per-site ownership from that identity.
@@ -28,7 +28,7 @@ def log(outcome, claims=None, cmd=""):
     try:
         with open(LOG, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {outcome} repo={c.get('repository', '-')} "
-                    f"ref={c.get('ref', '-')} event={c.get('event_name', '-')} cmd={cmd[:120]!r}\n")
+                    f"ref={c.get('ref', '-')} event={c.get('event_name', '-')} env={c.get('environment', '-')} cmd={cmd[:120]!r}\n")
     except OSError:
         pass
 
@@ -119,7 +119,10 @@ authorize(claims)
 
 env = {k: v for k, v in os.environ.items() if not k.startswith("LUNOVA_")}
 env.update(LUNOVA_REPO=claims["repository"], LUNOVA_REF=str(claims.get("ref", "")), LUNOVA_EVENT=str(claims.get("event_name", "")),
-           LUNOVA_ACTOR=str(claims.get("actor", "")))
+           LUNOVA_ACTOR=str(claims.get("actor", "")),
+           # v10: the GitHub environment the job ran in (only present when the job names one, e.g. production with required reviewers).
+           # The privileged modes (tenancy-setup, reset-db, bootstrap-admin) are refused server side unless this is "production".
+           LUNOVA_ENVIRONMENT=str(claims.get("environment", "")))
 
 if argv[0] == "lunova-site":
     log("ALLOW", claims, cmd)

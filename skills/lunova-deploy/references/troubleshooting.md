@@ -26,3 +26,4 @@
 | 500 right after deploy, `rolled back` | see `logs` mode | `gh workflow run lunova-deploy.yml -f mode=logs` |
 | `OK (Cloudflare proxy)` for a domain in check | domain is behind Cloudflare | origin not verifiable: keep DNS-only for the first cert (ops request #3) |
 | `rollback`: no earlier successful release | only one healthy release exists | deploy again or use `-f rollback_to=<id>` |
+| `must run in the GitHub environment 'production'` / `confirmation does not match` / certificate or Cloudflare errors | the v10 privileged modes | see the troubleshooting table in `tenancy.md` |

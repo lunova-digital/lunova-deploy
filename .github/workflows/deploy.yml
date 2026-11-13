@@ -1,16 +1,20 @@
-# Reusable Lunova deploy workflow (v9: v8 + an optional `public:` block on a service: its admin paths on a public name behind basic auth; v8: v7 + `type: docker`, a public site built from the project Dockerfile in CI and run in rootless Docker, plus `type: service`, an internal allow-listed container with no domain (e.g. the Signal gateway); v7: v6 + per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: v5 + per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
+# Reusable Lunova deploy workflow (v10: v9 + wildcard tenancy (`tenancy-setup`), `backup`, `reset-db`, `bootstrap-admin` and allow-listed `run` tasks. The three
+# destructive/privileged modes run in a SECOND job bound to the GitHub environment `production` (required reviewers) and are also refused
+# server side unless the OIDC token says so; v9: an optional `public:` block on a service: its admin paths on a public name behind basic auth; v8: `type: docker`
+# (a public site built from the project Dockerfile in CI and run in rootless Docker) and `type: service` (an internal allow-listed container with no domain);
+# v7: per-site PHP 8.3/8.4/8.5 via manifest `php:`; v6: per-job SSH/token state under RUNNER_TEMP, not $HOME, so two
 # self-hosted runner instances sharing one gh-runner user don't race on each other's key/known_hosts).
 # Public on purpose: it contains no secrets.
-# There is NO key, secret or variable to configure. The runner proves who it is with GitHub's OIDC token; the server
+# There is NO key, secret or variable to configure for deploy. The runner proves who it is with GitHub's OIDC token; the server
 # (lunova-gate) only accepts repositories owned by an allowed owner, running THIS workflow, and binds each site to the
-# repository and branch that first registered it.
+# repository and branch that first registered it. The tenancy-setup mode additionally takes three optional secrets (see references/tenancy.md).
 name: lunova-deploy
 
 on:
   workflow_call:
     inputs:
       mode:
-        description: "deploy | check | rollback | status | logs"
+        description: "deploy | check | rollback | status | logs | backup | run | tenancy-setup | reset-db | bootstrap-admin"
         type: string
         default: deploy
       manifest:
@@ -24,10 +28,40 @@ on:
         description: "Log lines to show in logs mode"
         type: string
         default: "80"
+      confirm:
+        description: "tenancy-setup, reset-db, bootstrap-admin: type the site name exactly"
+        type: string
+        default: ""
+      admin_email:
+        description: "bootstrap-admin: the first admin's email (also the {email} of a run task). NEVER a password: the admin gets an invite/set-password link"
+        type: string
+        default: ""
+      admin_name:
+        description: "bootstrap-admin: the first admin's name (also the {name} of a run task)"
+        type: string
+        default: ""
+      task:
+        description: "run: a task name from tasks: in .lunova.yml"
+        type: string
+        default: ""
+      dns_sync:
+        description: "tenancy-setup: also create the proxied Cloudflare records and the apex redirect (needs the CF_API_TOKEN secret)"
+        type: boolean
+        default: false
       self_hosted:
         description: "Run on the org's self-hosted [self-hosted, lunova] runners instead of GitHub-hosted ubuntu-latest"
         type: boolean
         default: false
+    secrets:
+      ORIGIN_CERT:
+        description: "tenancy-setup: the Cloudflare Origin CA certificate (PEM) for root_domain and *.root_domain"
+        required: false
+      ORIGIN_KEY:
+        description: "tenancy-setup: its private key (PEM)"
+        required: false
+      CF_API_TOKEN:
+        description: "tenancy-setup with dns_sync: a Cloudflare API token scoped to the one zone (DNS edit + redirect rules edit)"
+        required: false
 
 # The caller must grant id-token: write (the template does).
 permissions:
@@ -36,6 +70,7 @@ permissions:
 
 jobs:
   lunova:
+    if: ${{ !contains(fromJSON('["tenancy-setup", "reset-db", "bootstrap-admin"]'), inputs.mode) }}
     runs-on: ${{ inputs.self_hosted && fromJSON('["self-hosted", "lunova"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     concurrency:
@@ -46,6 +81,10 @@ jobs:
       MANIFEST: ${{ inputs.manifest }}
       ROLLBACK_TO: ${{ inputs.rollback_to }}
       LOG_LINES: ${{ inputs.lines }}
+      CONFIRM: ${{ inputs.confirm }}
+      ADMIN_EMAIL: ${{ inputs.admin_email }}
+      ADMIN_NAME: ${{ inputs.admin_name }}
+      TASK: ${{ inputs.task }}
       LUNOVA_HOST: 152.42.168.192
       LUNOVA_HOST_FPR: SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s
     steps:
@@ -55,10 +94,19 @@ jobs:
         run: |
           set -euo pipefail
           [ -f "$MANIFEST" ] || { echo "::error::$MANIFEST not found. Run the lunova-deploy skill to create it."; exit 1; }
+          pl=$(yq -r '.tenancy.platform_host // ""' "$MANIFEST"); rd=$(yq -r '.tenancy.root_domain // ""' "$MANIFEST"); wc=$(yq -r '.tenancy.wildcard // false' "$MANIFEST")
+          hosts=(); [ -z "$pl" ] || hosts+=("$pl")
+          while IFS= read -r h; do [ -z "$h" ] || hosts+=("$h"); done < <(yq -r '(.domains // [])[]' "$MANIFEST")
+          if [ "$wc" = "true" ] && [ -n "$rd" ]; then hosts+=("*.$rd"); fi
+          all=""; if [ "${#hosts[@]}" -gt 0 ]; then all=$(printf '%s\n' "${hosts[@]}" | awk '!seen[$0]++' | paste -sd, -); fi
           {
             echo "SITE=$(yq -r '.site' "$MANIFEST")"
             echo "TYPE=$(yq -r '.type' "$MANIFEST")"
             echo "DOMAINS=$(yq -r '(.domains // []) | join(",")' "$MANIFEST")"
+            echo "ALL_HOSTS=$all"
+            echo "TENANCY_JSON=$(yq -o=json -I=0 '.tenancy // {}' "$MANIFEST")"
+            echo "ROOT_DOMAIN=$rd"
+            echo "PLATFORM_HOST=$pl"
             echo "ROOT=$(yq -r '.root // ""' "$MANIFEST")"
             echo "START=$(yq -r '.start // ""' "$MANIFEST")"
             echo "HEALTH=$(yq -r '.health_path // "/"' "$MANIFEST")"
@@ -113,7 +161,7 @@ jobs:
           set -uo pipefail
           "$LUNOVA_DIR/lsh" lunova-site capabilities
           if [ "$TYPE" = "service" ]; then echo "::notice::Preflight passed (an internal service has no domain; see 'containers' above)"; exit 0; fi
-          IFS=, read -ra D <<< "$DOMAINS"
+          IFS=, read -ra D <<< "$ALL_HOSTS"
           "$LUNOVA_DIR/lsh" lunova-site check-domain --site "$SITE" "${D[@]}"
           rc=$?
           [ $rc -eq 0 ] && echo "::notice::Preflight passed" || echo "::warning::Domain problems above (DNS may still be propagating)"
@@ -137,6 +185,27 @@ jobs:
           set -euo pipefail
           args=(lunova-site rollback "$SITE")
           [ -n "$ROLLBACK_TO" ] && args+=(--to "$ROLLBACK_TO")
+          "$LUNOVA_DIR/lsh" "${args[@]}"
+
+      - name: Backup database (kept on the server, never uploaded)
+        if: env.MODE == 'backup'
+        run: |
+          set -euo pipefail
+          "$LUNOVA_DIR/lsh" lunova-site backup "$SITE" | tee "$RUNNER_TEMP/backup.log"
+          RESULT_LOG="$RUNNER_TEMP/backup.log" python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          r = json.loads([l for l in open(os.environ["RESULT_LOG"]) if l.startswith("RESULT ")][-1][7:])
+          print(f"### Backup: {r['site']}\n- path: `{r['path']}` (on the Lunova server; never uploaded)\n- size: {r['size']} bytes\n- sha256: `{r['sha256']}`")
+          PY
+
+      - name: Run an allow-listed task
+        if: env.MODE == 'run'
+        run: |
+          set -euo pipefail
+          [ -n "$TASK" ] || { echo "::error::mode=run needs the 'task' input (a name from tasks: in .lunova.yml)"; exit 1; }
+          args=(lunova-site run "$SITE" --task "$TASK")
+          if [ -n "$ADMIN_EMAIL" ]; then args+=(--arg "email=$ADMIN_EMAIL"); fi
+          if [ -n "$ADMIN_NAME" ]; then args+=(--arg "name=$ADMIN_NAME"); fi
           "$LUNOVA_DIR/lsh" "${args[@]}"
 
       # shivammathur/setup-php installs/switches PHP via sudo apt + update-alternatives, which on a
@@ -213,6 +282,10 @@ jobs:
             while IFS= read -r kv; do [ -n "$kv" ] && args+=(--env "$kv"); done < <(yq -r '.env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "$MANIFEST")
             while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done < <(yq -r '.volumes // [] | .[]' "$MANIFEST")
           fi
+          # v10: tenancy / seeders / tasks travel as JSON and are validated server side (lunova-site); absent keys change nothing
+          [ "$(yq -r 'has("tenancy")' "$MANIFEST")" = "true" ] && args+=(--tenancy-json "$(yq -o=json -I=0 '.tenancy' "$MANIFEST")")
+          [ "$(yq -r 'has("seeders")' "$MANIFEST")" = "true" ] && args+=(--seeders-json "$(yq -o=json -I=0 '.seeders' "$MANIFEST")")
+          [ "$(yq -r 'has("tasks")' "$MANIFEST")" = "true" ] && args+=(--tasks-json "$(yq -o=json -I=0 '.tasks' "$MANIFEST")")
           [ -n "$ROOT" ] && args+=(--root "$ROOT")
           [ -n "$START" ] && args+=(--start "$START")
           [ "$HTTP_ONLY" = "true" ] && args+=(--http-only)
@@ -281,5 +354,372 @@ jobs:
           {
             echo "### Lunova deploy: $SITE"
             echo "- Release: \`$RELEASE_ID\`"
-            if [ "$TYPE" = "service" ]; then echo "- internal service, image \`$(yq -r '.image' "$MANIFEST")\`"; ph=$(yq -r '.public.host // ""' "$MANIFEST"); [ -n "$ph" ] && echo "- admin name (login required, admin paths only): https://$ph"; else IFS=, read -ra D <<< "$DOMAINS"; for d in "${D[@]}"; do echo "- https://$d"; done; fi
+            if [ "$TYPE" = "service" ]; then echo "- internal service, image \`$(yq -r '.image' "$MANIFEST")\`"; ph=$(yq -r '.public.host // ""' "$MANIFEST"); [ -n "$ph" ] && echo "- admin name (login required, admin paths only): https://$ph"; else IFS=, read -ra D <<< "$ALL_HOSTS"; for d in "${D[@]}"; do echo "- https://$d"; done; fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify hosts (curl --resolve to the origin, bypassing Cloudflare)
+        if: env.MODE == 'check' || env.MODE == 'deploy'
+        env:
+          VERIFY_MODE: ${{ env.MODE == 'deploy' && 'strict' || 'warn' }}
+          VERIFY_HOSTS: ${{ env.ALL_HOSTS }}
+        run: |
+          python3 - <<'PY'
+          import os, re, secrets, subprocess, sys, tempfile
+          IP = os.environ.get("LUNOVA_HOST", "")
+          TLS_REFUSED = {35, 51, 52, 56, 58, 60, 66}   # handshake refused / empty reply / peer reset: the web server has no site for this name
+          LABEL = {"app": "app responded", "empty": "web server answered with an EMPTY response (no app output)",
+                   "no_site": "web server: No site configured for this name", "unreachable": "unreachable (no answer from the origin)"}
+
+          def classify(rc, code, headers, body):
+              """curl exit code + HTTP status + headers + body -> app | empty | no_site | unreachable. Probes `/`, never /up (that is 200 on any host)."""
+              if rc in TLS_REFUSED: return "no_site"
+              if rc != 0 or not code: return "unreachable"
+              b, h = (body or "").lower(), (headers or "").lower()
+              if "no site configured" in b: return "no_site"
+              if b.strip(): return "app"
+              if re.search(r"^(location|set-cookie|x-powered-by|x-inertia|x-livewire):", h, re.M): return "app"   # a redirect or session cookie only an app sets
+              return "empty"
+
+          def probe(host):
+              h = f"zzz-probe-{secrets.token_hex(4)}.{host[2:]}" if host.startswith("*.") else host   # wildcard: a random label nobody configured
+              with tempfile.TemporaryDirectory() as t:
+                  bf, hf = f"{t}/b", f"{t}/h"
+                  p = subprocess.run(["curl", "-sS", "-k", "--max-time", "20", "--resolve", f"{h}:443:{IP}", "-o", bf, "-D", hf, "-w", "%{http_code}", f"https://{h}/"],
+                                     capture_output=True, text=True)
+                  code = int(p.stdout.strip()) if p.stdout.strip().isdigit() else 0
+                  body = open(bf, errors="replace").read(4000) if os.path.exists(bf) else ""
+                  headers = open(hf, errors="replace").read() if os.path.exists(hf) else ""
+              return {"host": host, "probed": h, "rc": p.returncode, "code": code, "cls": classify(p.returncode, code, headers, body), "err": p.stderr.strip()[:160]}
+
+          def judge(mode, results):
+              """strict (after a deploy): every host must be answered by the app. setup (before the first deploy): the web server must hold a site for every
+              name and serve the wildcard exactly like the platform host. warn (check): report only."""
+              bad = []
+              if mode in ("strict", "warn"):
+                  bad = [f"{r['host']}: {LABEL[r['cls']]}" for r in results if r["cls"] != "app"]
+              else:
+                  bad = [f"{r['host']}: {LABEL[r['cls']]}" for r in results if r["cls"] in ("no_site", "unreachable")]
+                  sig = {(r["cls"], r["code"]) for r in results}
+                  if len(sig) > 1 and not bad: bad.append("the wildcard and the platform host are answered differently: " + ", ".join(f"{r['host']}={r['cls']}/{r['code']}" for r in results))
+              return bad
+
+          def main():
+              mode, hosts = os.environ.get("VERIFY_MODE", "warn"), [h for h in os.environ.get("VERIFY_HOSTS", "").split(",") if h]
+              if not hosts: print("no public hosts to verify"); return 0
+              res = [probe(h) for h in hosts]
+              lines = ["### Verify (curl --resolve to the origin, bypassing Cloudflare; path `/`)", "", "| host | probed as | result | HTTP |", "|---|---|---|---|"]
+              for r in res:
+                  print(f"{r['host']:32s} probed as {r['probed']:44s} -> {LABEL[r['cls']]} (HTTP {r['code']}, curl {r['rc']})" + (f" {r['err']}" if r["err"] else ""))
+                  lines.append(f"| `{r['host']}` | `{r['probed']}` | {LABEL[r['cls']]} | {r['code'] or '-'} |")
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write("\n".join(lines) + "\n\n")
+              bad = judge(mode, res)
+              for b in bad: print(f"::{'warning' if mode == 'warn' else 'error'}::{b}")
+              return 1 if bad and mode != "warn" else 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+
+      - name: Rendered site config and validation (job summary)
+        if: env.MODE == 'check' || env.MODE == 'deploy'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ "$TYPE" = "service" ]; then exit 0; fi
+          out=$("$LUNOVA_DIR/lsh" lunova-site show-config "$SITE" 2>&1); rc=$?
+          echo "$out"
+          { echo "### Rendered site config: $SITE"; echo '```'; echo "$out" | grep -v '^RESULT '; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+
+  lunova-privileged:
+    if: ${{ contains(fromJSON('["tenancy-setup", "reset-db", "bootstrap-admin"]'), inputs.mode) }}
+    # A static environment: the GitHub required-reviewers rule applies to this job, and the environment name is in the OIDC token, which the
+    # server checks again (lunova-gate -> lunova-site: LUNOVA_ENVIRONMENT must be "production"). Create the environment in the caller repo.
+    environment: production
+    runs-on: ${{ inputs.self_hosted && fromJSON('["self-hosted", "lunova"]') || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    concurrency:
+      group: lunova-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      MODE: ${{ inputs.mode }}
+      MANIFEST: ${{ inputs.manifest }}
+      ROLLBACK_TO: ${{ inputs.rollback_to }}
+      LOG_LINES: ${{ inputs.lines }}
+      CONFIRM: ${{ inputs.confirm }}
+      ADMIN_EMAIL: ${{ inputs.admin_email }}
+      ADMIN_NAME: ${{ inputs.admin_name }}
+      TASK: ${{ inputs.task }}
+      LUNOVA_HOST: 152.42.168.192
+      LUNOVA_HOST_FPR: SHA256:TwC/N1cK5ZgCM/3hfEKe24DWoYtpBsmU/PdPrnOHV3s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read manifest
+        run: |
+          set -euo pipefail
+          [ -f "$MANIFEST" ] || { echo "::error::$MANIFEST not found. Run the lunova-deploy skill to create it."; exit 1; }
+          pl=$(yq -r '.tenancy.platform_host // ""' "$MANIFEST"); rd=$(yq -r '.tenancy.root_domain // ""' "$MANIFEST"); wc=$(yq -r '.tenancy.wildcard // false' "$MANIFEST")
+          hosts=(); [ -z "$pl" ] || hosts+=("$pl")
+          while IFS= read -r h; do [ -z "$h" ] || hosts+=("$h"); done < <(yq -r '(.domains // [])[]' "$MANIFEST")
+          if [ "$wc" = "true" ] && [ -n "$rd" ]; then hosts+=("*.$rd"); fi
+          all=""; if [ "${#hosts[@]}" -gt 0 ]; then all=$(printf '%s\n' "${hosts[@]}" | awk '!seen[$0]++' | paste -sd, -); fi
+          {
+            echo "SITE=$(yq -r '.site' "$MANIFEST")"
+            echo "TYPE=$(yq -r '.type' "$MANIFEST")"
+            echo "DOMAINS=$(yq -r '(.domains // []) | join(",")' "$MANIFEST")"
+            echo "ALL_HOSTS=$all"
+            echo "TENANCY_JSON=$(yq -o=json -I=0 '.tenancy // {}' "$MANIFEST")"
+            echo "ROOT_DOMAIN=$rd"
+            echo "PLATFORM_HOST=$pl"
+            echo "ROOT=$(yq -r '.root // ""' "$MANIFEST")"
+            echo "START=$(yq -r '.start // ""' "$MANIFEST")"
+            echo "HEALTH=$(yq -r '.health_path // "/"' "$MANIFEST")"
+            echo "HTTP_ONLY=$(yq -r '.http_only // false' "$MANIFEST")"
+            echo "PHP_VERSION=$(yq -r '.php // ""' "$MANIFEST")"
+            echo "NODE_VERSION=$(yq -r '.node // ""' "$MANIFEST")"
+            echo "KEEP_NODE_MODULES=$(yq -r '.include_node_modules // false' "$MANIFEST")"
+          } >> "$GITHUB_ENV"
+
+      - name: Check the typed confirmation
+        run: |
+          set -euo pipefail
+          [ "$CONFIRM" = "$SITE" ] || { echo "::error::Confirmation does not match. Type the site name ($SITE) exactly in the 'confirm' input."; exit 1; }
+
+      - name: Connect (pinned host key, GitHub OIDC identity)
+        run: |
+          set -euo pipefail
+          # GitHub-hosted runners get a fresh $HOME every job, so ~/.ssh and ~/.lunova were always
+          # unique to this run. Persistent self-hosted runners don't: $HOME is the same directory on
+          # every job, and - critically - is shared by every runner *instance* on the host, since they
+          # all run as the same OS user. Two deploys landing on different runners at the same moment
+          # were overwriting each other's key/known_hosts/config mid-run. RUNNER_TEMP doesn't have
+          # either problem: it's wiped before each job, and each runner instance has its own _work tree,
+          # so it's unique per concurrently-running job even when $HOME is shared.
+          LUNOVA_DIR="${RUNNER_TEMP:-$HOME}/.lunova"
+          echo "LUNOVA_DIR=$LUNOVA_DIR" >> "$GITHUB_ENV"
+          install -d -m 700 "$LUNOVA_DIR" "$LUNOVA_DIR/ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "$LUNOVA_DIR/ssh/lunova_key"          # throwaway key for this run only
+          ssh-keyscan -t ed25519 "$LUNOVA_HOST" > "$LUNOVA_DIR/ssh/known_hosts" 2>/dev/null
+          ssh-keygen -lf "$LUNOVA_DIR/ssh/known_hosts" | grep -qF "$LUNOVA_HOST_FPR" \
+            || { echo "::error::Server host key does not match the pinned fingerprint. Refusing to connect."; exit 1; }
+          printf 'Host lunova\n  HostName %s\n  User deploy\n  IdentityFile %s/ssh/lunova_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile %s/ssh/known_hosts\n' \
+            "$LUNOVA_HOST" "$LUNOVA_DIR" "$LUNOVA_DIR" > "$LUNOVA_DIR/ssh/config"
+          # token: a fresh short-lived OIDC token per call (builds can outlast one token)
+          cat > "$LUNOVA_DIR/token" <<'EOS'
+          #!/bin/bash
+          set -e
+          curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=lunova" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["value"])'
+          EOS
+          # lsh <command> [args...]: run a command on the server through the gate (args are quoted safely; stdin is forwarded)
+          # -F pins this invocation to this job's own ssh config, never the user's default ~/.ssh/config.
+          cat > "$LUNOVA_DIR/lsh" <<EOS
+          #!/bin/bash
+          set -e
+          tok=\$("$LUNOVA_DIR/token")
+          exec ssh -F "$LUNOVA_DIR/ssh/config" -o BatchMode=yes lunova "LUNOVA_TOKEN=\$tok \$(printf '%q ' "\$@")"
+          EOS
+          chmod 700 "$LUNOVA_DIR/token" "$LUNOVA_DIR/lsh"
+          [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || { echo "::error::No OIDC token available. The caller workflow must set 'permissions: id-token: write'."; exit 1; }
+          "$LUNOVA_DIR/lsh" lunova-site list > /dev/null \
+            || { echo "::error::The server refused this run. It only accepts repositories owned by lunova-digital or jakiurcore, running the shared Lunova workflow."; exit 1; }
+
+      - name: "Tenancy: origin certificate and site config (on the server)"
+        if: env.MODE == 'tenancy-setup'
+        env:
+          ORIGIN_CERT: ${{ secrets.ORIGIN_CERT }}
+          ORIGIN_KEY: ${{ secrets.ORIGIN_KEY }}
+        run: |
+          set -euo pipefail
+          [ "$TENANCY_JSON" != "{}" ] || { echo "::error::.lunova.yml has no tenancy: block."; exit 1; }
+          args=(lunova-site tenancy-setup "$SITE" --confirm "$CONFIRM" --type "$TYPE" --domains "$DOMAINS" --health-path "$HEALTH" --tenancy-json "$TENANCY_JSON")
+          [ -z "$ROOT" ] || args+=(--root "$ROOT")
+          [ -z "$PHP_VERSION" ] || args+=(--php "$PHP_VERSION")
+          [ "$(yq -r 'has("seeders")' "$MANIFEST")" != "true" ] || args+=(--seeders-json "$(yq -o=json -I=0 '.seeders' "$MANIFEST")")
+          [ "$(yq -r 'has("tasks")' "$MANIFEST")" != "true" ] || args+=(--tasks-json "$(yq -o=json -I=0 '.tasks' "$MANIFEST")")
+          if [ -n "$ORIGIN_CERT" ] && [ -n "$ORIGIN_KEY" ]; then
+            # the certificate and key travel on stdin only (never argv, never a file on the runner); GitHub masks the secrets in the log
+            python3 -c 'import json,os;print(json.dumps({"cert":os.environ["ORIGIN_CERT"],"key":os.environ["ORIGIN_KEY"]}))' | "$LUNOVA_DIR/lsh" "${args[@]}"
+          else
+            echo "::notice::ORIGIN_CERT/ORIGIN_KEY not provided: keeping the certificate already installed on the server"
+            "$LUNOVA_DIR/lsh" "${args[@]}" < /dev/null
+          fi
+
+      - name: "Tenancy: Cloudflare DNS sync (proxied A records and apex redirect)"
+        if: env.MODE == 'tenancy-setup' && inputs.dns_sync
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$ROOT_DOMAIN" ] && [ -n "$PLATFORM_HOST" ] || { echo "::error::tenancy.root_domain and tenancy.platform_host are required"; exit 1; }
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+          DESC = "lunova: apex -> platform host"
+          PHASE = "http_request_dynamic_redirect"
+
+          def fail(msg):
+              print(msg); sys.exit(1)   # workflow commands are read from stdout
+
+          def want_rule(root, plat):
+              return {"description": DESC, "enabled": True, "expression": f'(http.host eq "{root}")', "action": "redirect",
+                      "action_parameters": {"from_value": {"status_code": 301, "preserve_query_string": True,
+                                                           "target_url": {"expression": f'concat("https://{plat}", http.request.uri.path)'}}}}
+
+          def same_rule(a, b): return all(a.get(k) == b.get(k) for k in ("expression", "action", "action_parameters", "enabled"))
+
+          def sync(api, root, plat, ip):
+              """Idempotent: look, compare, and write only what differs. api(method, path, body=None) -> (http_status, json). Never deletes anything."""
+              st, z = api("GET", f"/zones?name={root}")
+              if st != 200 or not z.get("result"): fail(f"::error::Cloudflare zone {root} not found or the token cannot read it (HTTP {st})")
+              zid = z["result"][0]["id"]; changed = 0
+              names = list(dict.fromkeys([root, plat, f"*.{root}"]))
+              for n in names:
+                  st, r = api("GET", f"/zones/{zid}/dns_records?name={n}")
+                  if st != 200: fail(f"::error::cannot list DNS records for {n} (HTTP {st}): the token needs Zone:DNS:Edit on this zone")
+                  recs = r.get("result", [])
+                  other = [x for x in recs if x["type"] != "A"]
+                  if other: fail(f"::error::{n} already has a {other[0]['type']} record. Refusing to replace it; remove it in Cloudflare if it is wrong.")
+                  body = {"type": "A", "name": n, "content": ip, "proxied": True, "ttl": 1}
+                  if not recs:
+                      st, _ = api("POST", f"/zones/{zid}/dns_records", body); changed += 1
+                      if st not in (200, 201): fail(f"::error::creating {n} failed (HTTP {st})")
+                      print(f"created  A {n} -> {ip} (proxied)")
+                  elif len(recs) == 1 and recs[0]["content"] == ip and recs[0].get("proxied") is True: print(f"ok       A {n} -> {ip} (proxied)")
+                  elif len(recs) == 1:
+                      st, _ = api("PATCH", f"/zones/{zid}/dns_records/{recs[0]['id']}", body); changed += 1
+                      if st != 200: fail(f"::error::updating {n} failed (HTTP {st})")
+                      print(f"updated  A {n} -> {ip} (proxied)")
+                  else: fail(f"::error::{n} has several A records; refusing to guess which to change")
+              if plat != root:
+                  path = f"/zones/{zid}/rulesets/phases/{PHASE}/entrypoint"
+                  st, e = api("GET", path)
+                  rules = e.get("result", {}).get("rules", []) if st == 200 else []
+                  if st not in (200, 404): fail(f"::error::cannot read redirect rules (HTTP {st}): the token needs the Single Redirect / Rulesets edit permission")
+                  mine = [r for r in rules if r.get("description") == DESC]; want = want_rule(root, plat)
+                  if len(mine) == 1 and same_rule(mine[0], want): print(f"ok       redirect {root} -> https://{plat} (301)")
+                  else:
+                      st, _ = api("PUT", path, {"rules": [r for r in rules if r.get("description") != DESC] + [want]}); changed += 1
+                      if st != 200: fail(f"::error::writing the redirect rule failed (HTTP {st})")
+                      print(f"written  redirect {root} -> https://{plat} (301)")
+              print(f"dns-sync done: {changed} change(s)")
+              return changed
+
+          def real_api(token):
+              def api(method, path, body=None):
+                  req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                               headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as r: return r.status, json.load(r)
+                  except urllib.error.HTTPError as e:
+                      try: return e.code, json.load(e)
+                      except ValueError: return e.code, {}
+              return api
+
+          if __name__ == "__main__":
+              t = os.environ.get("CF_API_TOKEN", "")
+              if not t: fail("::error::dns_sync needs the CF_API_TOKEN secret (a Cloudflare API token scoped to this one zone)")
+              sync(real_api(t), os.environ["ROOT_DOMAIN"], os.environ["PLATFORM_HOST"], os.environ["LUNOVA_HOST"])
+          PY
+
+      - name: Verify hosts (curl --resolve to the origin, bypassing Cloudflare)
+        if: env.MODE == 'tenancy-setup'
+        env:
+          VERIFY_MODE: setup
+          VERIFY_HOSTS: ${{ env.ALL_HOSTS }}
+        run: |
+          python3 - <<'PY'
+          import os, re, secrets, subprocess, sys, tempfile
+          IP = os.environ.get("LUNOVA_HOST", "")
+          TLS_REFUSED = {35, 51, 52, 56, 58, 60, 66}   # handshake refused / empty reply / peer reset: the web server has no site for this name
+          LABEL = {"app": "app responded", "empty": "web server answered with an EMPTY response (no app output)",
+                   "no_site": "web server: No site configured for this name", "unreachable": "unreachable (no answer from the origin)"}
+
+          def classify(rc, code, headers, body):
+              """curl exit code + HTTP status + headers + body -> app | empty | no_site | unreachable. Probes `/`, never /up (that is 200 on any host)."""
+              if rc in TLS_REFUSED: return "no_site"
+              if rc != 0 or not code: return "unreachable"
+              b, h = (body or "").lower(), (headers or "").lower()
+              if "no site configured" in b: return "no_site"
+              if b.strip(): return "app"
+              if re.search(r"^(location|set-cookie|x-powered-by|x-inertia|x-livewire):", h, re.M): return "app"   # a redirect or session cookie only an app sets
+              return "empty"
+
+          def probe(host):
+              h = f"zzz-probe-{secrets.token_hex(4)}.{host[2:]}" if host.startswith("*.") else host   # wildcard: a random label nobody configured
+              with tempfile.TemporaryDirectory() as t:
+                  bf, hf = f"{t}/b", f"{t}/h"
+                  p = subprocess.run(["curl", "-sS", "-k", "--max-time", "20", "--resolve", f"{h}:443:{IP}", "-o", bf, "-D", hf, "-w", "%{http_code}", f"https://{h}/"],
+                                     capture_output=True, text=True)
+                  code = int(p.stdout.strip()) if p.stdout.strip().isdigit() else 0
+                  body = open(bf, errors="replace").read(4000) if os.path.exists(bf) else ""
+                  headers = open(hf, errors="replace").read() if os.path.exists(hf) else ""
+              return {"host": host, "probed": h, "rc": p.returncode, "code": code, "cls": classify(p.returncode, code, headers, body), "err": p.stderr.strip()[:160]}
+
+          def judge(mode, results):
+              """strict (after a deploy): every host must be answered by the app. setup (before the first deploy): the web server must hold a site for every
+              name and serve the wildcard exactly like the platform host. warn (check): report only."""
+              bad = []
+              if mode in ("strict", "warn"):
+                  bad = [f"{r['host']}: {LABEL[r['cls']]}" for r in results if r["cls"] != "app"]
+              else:
+                  bad = [f"{r['host']}: {LABEL[r['cls']]}" for r in results if r["cls"] in ("no_site", "unreachable")]
+                  sig = {(r["cls"], r["code"]) for r in results}
+                  if len(sig) > 1 and not bad: bad.append("the wildcard and the platform host are answered differently: " + ", ".join(f"{r['host']}={r['cls']}/{r['code']}" for r in results))
+              return bad
+
+          def main():
+              mode, hosts = os.environ.get("VERIFY_MODE", "warn"), [h for h in os.environ.get("VERIFY_HOSTS", "").split(",") if h]
+              if not hosts: print("no public hosts to verify"); return 0
+              res = [probe(h) for h in hosts]
+              lines = ["### Verify (curl --resolve to the origin, bypassing Cloudflare; path `/`)", "", "| host | probed as | result | HTTP |", "|---|---|---|---|"]
+              for r in res:
+                  print(f"{r['host']:32s} probed as {r['probed']:44s} -> {LABEL[r['cls']]} (HTTP {r['code']}, curl {r['rc']})" + (f" {r['err']}" if r["err"] else ""))
+                  lines.append(f"| `{r['host']}` | `{r['probed']}` | {LABEL[r['cls']]} | {r['code'] or '-'} |")
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f: f.write("\n".join(lines) + "\n\n")
+              bad = judge(mode, res)
+              for b in bad: print(f"::{'warning' if mode == 'warn' else 'error'}::{b}")
+              return 1 if bad and mode != "warn" else 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+
+      - name: Rendered site config and validation (job summary)
+        if: env.MODE == 'tenancy-setup'
+        run: |
+          set -uo pipefail
+          if [ "$TYPE" = "service" ]; then exit 0; fi
+          out=$("$LUNOVA_DIR/lsh" lunova-site show-config "$SITE" 2>&1); rc=$?
+          echo "$out"
+          { echo "### Rendered site config: $SITE"; echo '```'; echo "$out" | grep -v '^RESULT '; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Reset database (backup first, then migrate:fresh and only the manifest seeders)
+        if: env.MODE == 'reset-db'
+        run: |
+          set -euo pipefail
+          "$LUNOVA_DIR/lsh" lunova-site reset-db "$SITE" --confirm "$CONFIRM" | tee "$RUNNER_TEMP/reset.log"
+          RESULT_LOG="$RUNNER_TEMP/reset.log" python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          r = json.loads([l for l in open(os.environ["RESULT_LOG"]) if l.startswith("RESULT ")][-1][7:])
+          print(f"### Database reset: {r['site']}\n- backup taken first: `{r['backup']}` (on the server)\n- seeders run: {', '.join(r['seeders']) or 'none'}")
+          PY
+
+      - name: Bootstrap the first admin (no password; the output is kept off the log)
+        if: env.MODE == 'bootstrap-admin'
+        run: |
+          set -uo pipefail
+          [ -n "$ADMIN_EMAIL" ] && [ -n "$ADMIN_NAME" ] || { echo "::error::bootstrap-admin needs admin_email and admin_name"; exit 1; }
+          out=$("$LUNOVA_DIR/lsh" lunova-site bootstrap-admin "$SITE" --confirm "$CONFIRM" --arg "email=$ADMIN_EMAIL" --arg "name=$ADMIN_NAME" 2>&1); rc=$?
+          # belt and braces: the server never returns a link, but if anything link-like ever appeared it is masked before it can be printed
+          printf '%s\n' "$out" | grep -oE 'https?://[^[:space:]]+' | while IFS= read -r u; do echo "::add-mask::$u"; done
+          printf '%s\n' "$out" | sed -E 's#https?://[^[:space:]]+#<link redacted>#g' | grep -v '^RESULT '
+          if [ $rc -eq 0 ]; then
+            file=$(printf '%s\n' "$out" | grep '^RESULT ' | tail -1 | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()[7:]).get("secret_file") or "")')
+            { echo "### Admin bootstrapped: $SITE"; echo "- admin: \`$ADMIN_EMAIL\` (no password was set or shown)"; [ -z "$file" ] || echo "- the app's output (e.g. an invite link) is in a root-only file on the server: \`$file\`"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc

@@ -1,0 +1,29 @@
+#!/bin/bash
+# ops-only, one time, idempotent. Enables the v10 modes: wildcard tenancy (origin certificate), backup, reset-db, bootstrap-admin, allow-listed tasks.
+#
+# What it changes on the server:
+#   * installs the v10 `lunova-site` (/usr/local/bin) and `lunova-gate` (/usr/local/bin; it now also exports the GitHub environment of the run)
+#   * installs /usr/local/sbin/lunova-priv (the ONE root helper for these modes) and a sudoers rule letting `deploy` run ONLY that helper
+#   * creates /etc/caddy/certs (root:caddy 0750; certificates are installed there by `mode=tenancy-setup`), /srv/backups (0755, per-site dirs are
+#     created 0700 for deploy by the helper) and /var/lib/lunova/secrets (0700 root: bootstrap-admin output, e.g. an invite link, lands here)
+#   * requires `mysqldump` (mariadb-client) for backups: installs it if missing
+# Usage:  ops/setup-tenancy [ssh-host]      (default host `lunova`)
+set -euo pipefail
+HOST="${1:-lunova}"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+python3 -m py_compile "$HERE/server/lunova-site" "$HERE/server/lunova-gate" "$HERE/server/lunova-priv"
+scp -q "$HERE/server/lunova-priv" "$HERE/server/lunova-site" "$HERE/server/lunova-gate" "$HOST:/tmp/"
+ssh "$HOST" "set -e
+command -v mysqldump >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-client; }
+sudo install -m 755 -o root -g root /tmp/lunova-priv /usr/local/sbin/lunova-priv
+sudo install -m 755 -o root -g root /tmp/lunova-site /usr/local/bin/lunova-site
+sudo install -m 755 -o root -g root /tmp/lunova-gate /usr/local/bin/lunova-gate
+rm -f /tmp/lunova-priv /tmp/lunova-site /tmp/lunova-gate
+sudo install -d -m 750 -o root -g caddy /etc/caddy/certs
+sudo install -d -m 755 -o root -g root /srv/backups
+sudo install -d -m 700 -o root -g root /var/lib/lunova/secrets
+echo 'deploy ALL=(root) NOPASSWD: /usr/local/sbin/lunova-priv' | sudo tee /etc/sudoers.d/lunova-priv >/dev/null
+sudo chmod 440 /etc/sudoers.d/lunova-priv && sudo visudo -cf /etc/sudoers.d/lunova-priv
+sudo -u deploy sudo -n /usr/local/sbin/lunova-priv validate || echo 'NOTE: caddy validate failed right now (see above); fix the web server config before using tenancy-setup'
+ls -ld /etc/caddy/certs /srv/backups /var/lib/lunova/secrets; command -v mysqldump"
+echo "tenancy modes enabled. Next: GitHub secrets + the 'production' environment (see skills/lunova-deploy/references/tenancy.md)."

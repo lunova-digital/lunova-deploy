@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""lunova-priv: the ONE root helper for the v10 privileged modes. Root-owned, installed at /usr/local/sbin.
+
+`deploy` may run only `sudo lunova-priv <subcommand> ...` (one narrow sudoers line, see ops/setup-tenancy). Nothing here takes a shell string or a
+path from the caller: every argument is validated against a strict pattern, secrets arrive on stdin, never argv.
+
+  install-cert <name> <root_domain>   stdin: JSON {"cert": PEM, "key": PEM}. Checks the pair matches, is not expired and covers root + *.root; writes
+                                       /etc/caddy/certs/<name>.{pem,key} (root:caddy, key 0640), validates the web server config, reloads it, and
+                                       puts the PREVIOUS pair back if anything fails. Same cert again = "unchanged".
+  ensure-backup-dir <site>            /srv/backups/<site>, owner deploy, 0700
+  store-secret <site> <label>         stdin -> /var/lib/lunova/secrets/<site>/<label>-<utc>.txt (root:root 0600); prints ONLY the path
+  validate                            `caddy validate` of the live config (as root: it can read the keys); exit code = result
+Every call appends one line to /srv/registry/audit.log.
+"""
+import grp, hashlib, json, os, pwd, re, shutil, subprocess, sys, tempfile, time
+from pathlib import Path
+
+CERTS = Path(os.environ.get("LUNOVA_CERTS", "/etc/caddy/certs")); BACKUPS = Path(os.environ.get("LUNOVA_BACKUPS", "/srv/backups"))
+SECRETS = Path(os.environ.get("LUNOVA_SECRETS", "/var/lib/lunova/secrets")); AUDIT = Path(os.environ.get("LUNOVA_AUDIT", "/srv/registry/audit.log"))
+CADDYFILE = "/etc/caddy/Caddyfile"; RELOAD = "/usr/local/sbin/caddy-reload"
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$"); CERT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,60}$"); LABEL_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+
+
+def die(m, code=1): print(f"ERROR: {m}", file=sys.stderr); sys.exit(code)
+
+
+def audit(what, result):
+    who = os.environ.get("SUDO_USER", "-")
+    try:
+        with open(AUDIT, "a") as f: f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} helper=lunova-priv sudo_user={who} op={what} result={result}\n")
+    except OSError: pass
+
+
+def sh(cmd, **kw): return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+def san_names(cert_pem):
+    """DNS names in the certificate's SAN list (openssl, so there is no extra dependency)."""
+    p = sh(["openssl", "x509", "-noout", "-ext", "subjectAltName"], input=cert_pem)
+    if p.returncode != 0: die("not a valid certificate")
+    return set(re.findall(r"DNS:([^,\s]+)", p.stdout))
+
+
+def pubkey_fp(args, data):
+    p = sh(args, input=data)
+    return hashlib.sha256(p.stdout.encode()).hexdigest() if p.returncode == 0 and p.stdout.strip() else None
+
+
+def check_pair(cert, key, root):
+    """Returns None when the pair is good, else the reason (pure apart from calling openssl; unit-tested with generated certs)."""
+    if "BEGIN" not in cert or "PRIVATE KEY" not in key: return "cert and key must be PEM"
+    c = pubkey_fp(["openssl", "x509", "-noout", "-pubkey"], cert); k = pubkey_fp(["openssl", "pkey", "-pubout"], key)
+    if not c or not k: return "cannot read the certificate or the key"
+    if c != k: return "the key does not belong to this certificate"
+    if sh(["openssl", "x509", "-noout", "-checkend", "0"], input=cert).returncode != 0: return "the certificate has expired"
+    names = san_names(cert)
+    for need in (root, f"*.{root}"):
+        if need not in names: return f"the certificate does not cover {need} (it lists: {', '.join(sorted(names)) or 'nothing'})"
+    return None
+
+
+def write(path, data, mode, group):
+    tmp = path.with_name(path.name + ".new"); fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f: f.write(data)
+    os.chmod(tmp, mode)
+    try: os.chown(tmp, 0, grp.getgrnam(group).gr_gid)
+    except (KeyError, PermissionError): pass     # not root / no such group (tests); the real run is root with a caddy group
+    os.replace(tmp, path)
+
+
+def validate_and_reload():
+    v = sh(["caddy", "validate", "--config", CADDYFILE, "--adapter", "caddyfile"])
+    if v.returncode != 0: return f"web server config invalid: {(v.stdout + v.stderr).strip()[-600:]}"
+    r = sh(["sudo", "-n", RELOAD]) if os.geteuid() != 0 else sh([RELOAD])
+    return None if r.returncode == 0 else f"reload failed: {(r.stdout + r.stderr).strip()[-600:]}"
+
+
+def cmd_install_cert(name, root):
+    if not CERT_RE.match(name) or not HOST_RE.match(root): die("bad name or root domain")
+    try: b = json.loads(sys.stdin.read(40000)); cert, key = b["cert"], b["key"]
+    except (ValueError, KeyError, TypeError): die("stdin must be JSON with cert and key")
+    why = check_pair(cert, key, root)
+    if why: audit(f"install-cert:{name}", "REFUSED"); die(why)
+    CERTS.mkdir(parents=True, exist_ok=True); os.chmod(CERTS, 0o750)
+    try: os.chown(CERTS, 0, grp.getgrnam("caddy").gr_gid)
+    except (KeyError, PermissionError): pass
+    pem, kf = CERTS / f"{name}.pem", CERTS / f"{name}.key"
+    if pem.exists() and kf.exists() and pem.read_text() == cert and kf.read_text() == key:
+        audit(f"install-cert:{name}", "unchanged"); print(f"certificate '{name}' unchanged (already installed)"); return
+    old = {p: p.read_text() for p in (pem, kf) if p.exists()}
+    write(pem, cert, 0o644, "caddy"); write(kf, key, 0o640, "caddy")
+    bad = validate_and_reload()
+    if bad:
+        for p in (pem, kf):
+            if p in old: write(p, old[p], 0o640 if p == kf else 0o644, "caddy")
+            else: p.unlink(missing_ok=True)
+        validate_and_reload()
+        audit(f"install-cert:{name}", "ROLLED_BACK"); die(f"{bad}. The previous certificate was restored.")
+    audit(f"install-cert:{name}", "installed"); print(f"certificate '{name}' installed (covers {root} and *.{root}); web server reloaded")
+
+
+def cmd_backup_dir(site):
+    if not NAME_RE.match(site): die("invalid site")
+    d = BACKUPS / site; d.mkdir(parents=True, exist_ok=True)
+    try: os.chown(d, pwd.getpwnam("deploy").pw_uid, 0)
+    except (KeyError, PermissionError): pass
+    os.chmod(d, 0o700); audit(f"ensure-backup-dir:{site}", "ok")
+
+
+def cmd_store_secret(site, label):
+    if not NAME_RE.match(site) or not LABEL_RE.match(label): die("bad site or label")
+    data = sys.stdin.read(200000)
+    d = SECRETS / site; d.mkdir(parents=True, exist_ok=True); os.chmod(SECRETS, 0o700); os.chmod(d, 0o700)
+    f = d / f"{label}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.txt"
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as h: h.write(data)
+    audit(f"store-secret:{site}:{label}", "ok"); print(f)
+
+
+def cmd_validate():
+    v = sh(["caddy", "validate", "--config", CADDYFILE, "--adapter", "caddyfile"])
+    print((v.stdout + v.stderr).strip()[-1500:]); audit("validate", "ok" if v.returncode == 0 else "FAILED"); sys.exit(v.returncode)
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["install-cert"] and len(a) == 3: cmd_install_cert(a[1], a[2])
+    elif a[:1] == ["ensure-backup-dir"] and len(a) == 2: cmd_backup_dir(a[1])
+    elif a[:1] == ["store-secret"] and len(a) == 3: cmd_store_secret(a[1], a[2])
+    elif a == ["validate"]: cmd_validate()
+    else: die("usage: lunova-priv install-cert <name> <root> | ensure-backup-dir <site> | store-secret <site> <label> | validate")
+
+
+if __name__ == "__main__":
+    main()
