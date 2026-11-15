@@ -1,0 +1,40 @@
+#!/bin/bash
+# ops-only, one time, idempotent. Stops leaked libsignal extractions from filling the disk.
+# The lunova-signal container's Java app (libsignal) extracts a ~185 MB libsignal_jni_amd64.so into /tmp/libsignal<N>/ on every call
+# and never deletes it; /tmp is the container's writable layer, so it grew to 39 GB and filled the server disk (2026-11-15).
+# A capped tmpfs is NOT used: one extraction is 185 MB, so a cap would break the app after 1-2 calls and tmpfs is charged to the memory limit.
+# Instead a systemd timer (every 10 min, as `deploy`) deletes extractions older than 10 minutes and prunes dangling images.
+# Usage:  ops/setup-tmp-janitor [ssh-host] [container]   (default host `lunova`, container lunova-lunova-signal)
+set -euo pipefail
+HOST="${1:-lunova}"; CT="${2:-lunova-lunova-signal}"
+ssh "$HOST" "set -e
+sudo tee /usr/local/sbin/lunova-tmp-janitor >/dev/null <<'SH'
+#!/bin/bash
+export DOCKER_HOST=unix:///run/user/\$(id -u)/docker.sock
+D=/home/deploy/bin/docker
+\$D inspect '$CT' >/dev/null 2>&1 && \$D exec '$CT' find /tmp -maxdepth 1 -name 'libsignal*' -mmin +10 -exec rm -rf {} +
+\$D image prune -f >/dev/null 2>&1 || true
+SH
+sudo chmod 755 /usr/local/sbin/lunova-tmp-janitor
+sudo tee /etc/systemd/system/lunova-tmp-janitor.service >/dev/null <<'U'
+[Unit]
+Description=Remove leaked libsignal extractions from the signal container
+[Service]
+Type=oneshot
+User=deploy
+ExecStart=/usr/local/sbin/lunova-tmp-janitor
+U
+sudo tee /etc/systemd/system/lunova-tmp-janitor.timer >/dev/null <<'U'
+[Unit]
+Description=Run lunova-tmp-janitor every 10 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+[Install]
+WantedBy=timers.target
+U
+sudo systemctl daemon-reload
+sudo systemctl enable --now lunova-tmp-janitor.timer
+sudo systemctl start lunova-tmp-janitor.service
+systemctl list-timers lunova-tmp-janitor.timer --no-pager
+"
